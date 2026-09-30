@@ -10,6 +10,7 @@ Prerequisites (tell the user if one is missing): the user has a Filament account
 2. Fetch that metadata to get the authorization server (`https://api.filament.dm/mcp/agents/oauth`), then fetch the server's `/.well-known/oauth-authorization-server` metadata. Record `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `code_challenge_methods_supported` (includes `S256`), `scopes_supported` (`filament:agent:control`) and `token_endpoint_auth_methods_supported` (`none`).
 3. Call `credentials.request_api_access` for a service called **Filament** with exactly that scheme: OAuth 2.0 authorization code with PKCE (S256), dynamic client registration (no pre-existing client id or secret), scope `filament:agent:control`, bearer token in the Authorization header, allowed host `api.filament.dm`. **Name the connector `custom.filament-oauth`**: the CLI in Part B reads that name. If the tool cannot express the scheme, stop and tell the user exactly what it refused.
 4. Show the user the approval link. They log into Filament and, on the select-agent page, pick an existing agent or create a new one with the name they want. The tokens land in the Secure Vault; you never see them. Filament's access tokens do not expire.
+5. You are not notified when the approval completes. So, in the same message as the link, tell the user: "Reply *connected* once you've approved." End the turn. When they reply, continue with Part B. Do not poll or wait for a notification that will not come.
 
 ## Part B: install the skill
 
