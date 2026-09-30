@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""Filament agent CLI for Muse.
+
+Subcommands: listen, reply, ack, call, self, hello, reset, ensure.
+Prints one JSON object to stdout; diagnostics to stderr.
+Exit codes: 0 = success / work found; 3 = no work before the deadline;
+            2 = authentication failure; 1 = any other error after retries.
+
+See SKILL.md and references/protocol.md.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+import dynamic_credentials as dc
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE_DIR = os.path.join(SKILL_DIR, "state")
+
+BASE_URL = "https://api.filament.dm/mcp/agents"
+HEARTBEAT_URL = BASE_URL + "/heartbeat"
+ALLOWED_HOSTS = ["api.filament.dm"]
+CREDENTIAL_NAME = "custom.filament-oauth"
+CLIENT_INFO = {"name": "filament-skill", "version": "1.0"}
+
+AUTH_ERROR_CODES = {-32001, -32002}
+# A lock whose mtime is younger than this is a live listener.
+LOCK_ALIVE_SECONDS = 120
+# Duplicate-reply guard: last N replied event ids (no expiry; the server's
+# work state is best-effort, so an id answered once is never answered again
+# while it is still recorded here).
+REPLIED_MAX = 1000
+
+
+def diag(msg):
+    print(f"filament: {msg}", file=sys.stderr)
+
+
+def state_path(name):
+    return os.path.join(STATE_DIR, name)
+
+
+def write_state(name, text):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(state_path(name), "w") as f:
+        f.write(text)
+
+
+def _lock_info():
+    """(content, age_seconds) of state/run.lock, or (None, None) if absent."""
+    path = state_path("run.lock")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, None
+    try:
+        with open(path) as f:
+            content = f.read().strip()
+    except OSError:
+        content = ""
+    return content, time.time() - st.st_mtime
+
+
+def _touch_lock():
+    try:
+        os.utime(state_path("run.lock"), None)
+    except OSError:
+        pass
+
+
+def _load_replied():
+    """{event_id: epoch} of replies the CLI has made. No expiry."""
+    try:
+        with open(state_path("replied.json")) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {eid: ts for eid, ts in data.items()
+            if isinstance(ts, (int, float))}
+
+
+def _save_replied(mapping):
+    items = sorted(mapping.items(), key=lambda kv: kv[1])[-REPLIED_MAX:]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = state_path("replied.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump({eid: ts for eid, ts in items}, f)
+    os.replace(tmp, state_path("replied.json"))
+
+
+def _record_replied(event_ids):
+    mapping = _load_replied()
+    now = time.time()
+    for eid in event_ids:
+        mapping[eid] = now
+    _save_replied(mapping)
+
+
+class FilamentError(Exception):
+    """A failed Filament request. auth=True means the token was rejected."""
+
+    def __init__(self, message, auth=False):
+        super().__init__(message)
+        self.auth = auth
+
+
+class Client:
+    """Single-process MCP client: handshake once, then tool calls."""
+
+    def __init__(self):
+        self.session_id = None
+        self._next = 0
+        self.handshook = False
+        # Filled by load_identity(): the agent's display name and its
+        # principal's display name, read live from get_self. Nothing about
+        # the agent's identity is hardcoded in this CLI.
+        self.agent_name = None
+        self.principal_name = None
+
+    # -- low level ----------------------------------------------------
+
+    def _next_id(self):
+        self._next += 1
+        return self._next
+
+    def _raw_post(self, url, body, timeout):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers=headers)
+        dc.add_surrogate_to_request(req, CREDENTIAL_NAME,
+                                    allowed_hosts=ALLOWED_HOSTS)
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise FilamentError(f"HTTP {e.code} from {url}", auth=True)
+            raise
+        sid = resp.headers.get("Mcp-Session-Id")
+        if sid:
+            self.session_id = sid
+        raw = dc.read_response_body(resp)
+        if "text/event-stream" in resp.headers.get("Content-Type", ""):
+            raw = self._sse_last_json(raw)
+        return raw
+
+    @staticmethod
+    def _sse_last_json(raw):
+        text = raw.decode("utf-8", errors="replace")
+        last = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload in ("", "[DONE]"):
+                    continue
+                try:
+                    last = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+        if last is None:
+            raise FilamentError("SSE response had no complete JSON object")
+        return json.dumps(last).encode("utf-8")
+
+    def _rpc(self, method, params, timeout):
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": self._next_id(),
+            "method": method, "params": params,
+        }, separators=(",", ":")).encode("utf-8")
+        raw = self._raw_post(BASE_URL, body, timeout)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise FilamentError(f"malformed JSON response: {e}")
+        if not isinstance(data, dict) or data.get("jsonrpc") != "2.0":
+            raise FilamentError("response was not a JSON-RPC object")
+        err = data.get("error")
+        if err is not None:
+            code = err.get("code") if isinstance(err, dict) else None
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            if code in AUTH_ERROR_CODES:
+                raise FilamentError(f"auth error {code}: {msg}", auth=True)
+            raise FilamentError(f"JSON-RPC error {code}: {msg}")
+        result = data.get("result")
+        if isinstance(result, dict) and result.get("_sessionId"):
+            self.session_id = result["_sessionId"]
+        return result
+
+    def _notify(self, method, params, timeout=30):
+        body = json.dumps({"jsonrpc": "2.0", "method": method,
+                           "params": params},
+                          separators=(",", ":")).encode("utf-8")
+        self._raw_post(BASE_URL, body, timeout)  # empty 2xx; body ignored
+
+    # -- handshake ----------------------------------------------------
+
+    def handshake(self):
+        if self.handshook:
+            return
+        self._rpc("initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": CLIENT_INFO,
+        }, timeout=30)
+        self._notify("notifications/initialized", {})
+        self.handshook = True
+
+    # -- tools --------------------------------------------------------
+
+    def tool_call(self, name, arguments, timeout=30):
+        return self._rpc("tools/call",
+                         {"name": name, "arguments": arguments},
+                         timeout=timeout)
+
+    def heartbeat(self, timeout=30):
+        self._raw_post(HEARTBEAT_URL, b"", timeout)
+
+
+def call_with_retry(fn, deadline, desc):
+    """Run fn(); retry retryable failures 3x with 2/4/8s backoff.
+
+    Retryable: HTTP 5xx, 429, connection errors, malformed JSON, JSON-RPC
+    errors other than -32001/-32002. Auth errors and credential errors
+    propagate immediately. Never sleeps past deadline (None = no deadline).
+    """
+    last = None
+    for attempt, backoff in enumerate((0, 2, 4, 8)):
+        if attempt:
+            if deadline is not None and time.time() + backoff > deadline:
+                break
+            diag(f"{desc} failed: {last} — retrying in {backoff}s")
+            time.sleep(backoff)
+        try:
+            return fn()
+        except FilamentError as e:
+            if e.auth:
+                raise
+            last = e
+        except (urllib.error.URLError, OSError) as e:
+            last = FilamentError(f"{desc}: network error: {e}")
+    raise last if last is not None else FilamentError(f"{desc}: failed")
+
+
+def parse_tool_result(result):
+    """result.content[0].text holds a JSON string; return it parsed."""
+    try:
+        text = result["content"][0]["text"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise FilamentError(f"unexpected tool result shape: {e}")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"text": text}
+
+
+def load_identity(client, deadline=None):
+    """Read (agent_name, principal_name) from get_self; stash on the client.
+
+    Called at the start of listen, reply and hello so no identity is ever
+    hardcoded. Auth errors propagate (the run must end as an auth failure);
+    any other get_self failure falls back to generic names so a transient
+    blip never kills a listen or a reply.
+    """
+    try:
+        result = call_with_retry(lambda: client.tool_call("get_self", {}),
+                                 deadline, "get_self")
+    except FilamentError as e:
+        if e.auth:
+            raise
+        diag(f"get_self failed ({e}) — using generic identity")
+        client.agent_name, client.principal_name = "agent", "principal"
+        return client.agent_name, client.principal_name
+    inner = parse_tool_result(result)
+    if not isinstance(inner, dict):
+        diag("get_self returned no JSON object — using generic identity")
+        inner = {}
+    owner = inner.get("owner") if isinstance(inner.get("owner"), dict) else {}
+    client.agent_name = (inner.get("display_name")
+                         or inner.get("user_id") or "agent")
+    client.principal_name = (owner.get("display_name")
+                             or inner.get("owner_id") or "principal")
+    return client.agent_name, client.principal_name
+
+
+# -- subcommands ------------------------------------------------------
+
+def cmd_self(client):
+    call_with_retry(client.handshake, None, "handshake")
+    result = call_with_retry(lambda: client.tool_call("get_self", {}),
+                             None, "get_self")
+    print(json.dumps(parse_tool_result(result), indent=2))
+    return 0
+
+
+def cmd_call(client, tool, args_json):
+    try:
+        arguments = json.loads(args_json)
+    except json.JSONDecodeError as e:
+        raise FilamentError(f"bad args JSON: {e}")
+    call_with_retry(client.handshake, None, "handshake")
+    result = call_with_retry(lambda: client.tool_call(tool, arguments),
+                             None, f"tools/call {tool}")
+    print(json.dumps(parse_tool_result(result), indent=2))
+    return 0
+
+
+def cmd_hello(client):
+    call_with_retry(client.handshake, None, "handshake")
+    agent_name, _ = load_identity(client)
+    result = call_with_retry(
+        lambda: client.tool_call("message_principal", {
+            "markdown_body":
+                f"Hello from Muse — {agent_name} is now listening on Filament."
+        }), None, "message_principal")
+    print(json.dumps(parse_tool_result(result), indent=2))
+    return 0
+
+
+def cmd_ack(client, event_ids):
+    call_with_retry(client.handshake, None, "handshake")
+    result = call_with_retry(
+        lambda: client.tool_call("poll_work",
+                                 {"wait_seconds": 0, "ack": event_ids}),
+        None, "poll_work ack")
+    print(json.dumps(parse_tool_result(result), indent=2))
+    return 0
+
+
+def cmd_reply(client, with_json, body, for_ids):
+    try:
+        rw = json.loads(with_json)
+    except json.JSONDecodeError as e:
+        raise FilamentError(f"bad --with JSON: {e}")
+    tool = rw.get("tool")
+    if not tool:
+        raise FilamentError("--with JSON has no 'tool'")
+    event_ids = [e.strip() for e in (for_ids or "").split(",") if e.strip()]
+    # Identity first: the handshake is idempotent and safe to retry, and
+    # nothing below records anything, so a failure here never marks the
+    # item replied.
+    call_with_retry(client.handshake, None, "handshake")
+    load_identity(client)
+    if event_ids and all(e in _load_replied() for e in event_ids):
+        # Duplicate guard: every id in this item was already replied to,
+        # so ack it instead of posting a second reply.
+        call_with_retry(client.handshake, None, "handshake")
+        call_with_retry(
+            lambda: client.tool_call(
+                "poll_work", {"wait_seconds": 0, "ack": event_ids}),
+            None, "poll_work ack")
+        diag(f"duplicate reply suppressed; acked {len(event_ids)} id(s)")
+        print(json.dumps({"acked": event_ids}))
+        return 0
+    arguments = dict(rw.get("args") or {})
+    arguments["markdown_body"] = body
+    # The handshake is idempotent and safe to retry. The reply itself gets
+    # exactly one attempt: the server refuses a second reply to the same item,
+    # so on an unknown outcome the next listen decides whether it landed.
+    call_with_retry(client.handshake, None, "handshake")
+    # Record AFTER the handshake succeeds, immediately before the reply
+    # request: a handshake failure (network blip) must not mark the item
+    # replied — no reply was ever attempted, so the item must come back
+    # fresh. Once the reply is attempted, an unknown outcome (timeout,
+    # reset) counts as replied, so a repeat of the item is acked rather
+    # than answered twice.
+    if event_ids:
+        _record_replied(event_ids)
+    try:
+        result = client.tool_call(tool, arguments, timeout=30)
+    except (urllib.error.URLError, OSError) as e:
+        raise FilamentError(
+            f"reply: network error (outcome unknown, not retried): {e}")
+    print(json.dumps(parse_tool_result(result), indent=2))
+    return 0
+
+
+def cmd_listen(client, deadline, wait):
+    if os.path.exists(state_path("auth_failed")):
+        diag("auth_failed marker present — no request attempted")
+        return 2
+
+    run_start = os.environ.get("FILAMENT_RUN_START")
+    try:
+        run_start = str(int(run_start)) if run_start else str(int(time.time()))
+    except ValueError:
+        run_start = str(int(time.time()))
+    lock = state_path("run.lock")
+    content, age = _lock_info()
+    if (content is not None and age < LOCK_ALIVE_SECONDS
+            and content != run_start):
+        diag(f"another run is listening (run.lock age {int(age)}s) — exiting")
+        return 3
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(lock, "w") as f:
+        f.write(run_start)
+
+    def release_lock():
+        try:
+            with open(lock) as f:
+                if f.read().strip() == run_start:
+                    os.remove(lock)
+        except OSError:
+            pass
+
+    def on_term(signum, frame):
+        release_lock()
+        os._exit(3)
+
+    old_term = signal.signal(signal.SIGTERM, on_term)
+    try:
+        return _listen_loop(client, deadline, wait)
+    finally:
+        release_lock()
+        signal.signal(signal.SIGTERM, old_term)
+
+
+def _poll(client, cursor, skip_ids, poll_wait, deadline):
+    arguments = {"wait_seconds": poll_wait, "max_items": 10}
+    if cursor is not None:
+        arguments["cursor"] = cursor
+    if skip_ids:
+        # Opportunistic: offer already-answered ids as ack (the server may
+        # ignore them; the client-side filter below is the real guard).
+        arguments["ack"] = sorted(skip_ids)
+    result = call_with_retry(
+        lambda: client.tool_call("poll_work", arguments,
+                                 timeout=poll_wait + 15),
+        deadline, "poll_work")
+    inner = parse_tool_result(result)
+    if not isinstance(inner, dict):
+        raise FilamentError(f"unexpected poll_work shape: {inner!r}")
+    return inner
+
+
+def _split_work(work):
+    """Split poll_work items into (fresh, answered_ids).
+
+    An item whose every message id is in state/replied.json was already
+    answered: server-side consumption is best-effort (per-worker in-memory
+    state), so a resurfaced item must not end the listen — filter it out.
+    """
+    replied = _load_replied()
+    fresh, answered = [], set()
+    for item in work:
+        ids = [m.get("event_id") for m in item.get("messages", [])
+               if m.get("event_id")]
+        if ids and all(i in replied for i in ids):
+            answered.update(ids)
+        else:
+            fresh.append(item)
+    return fresh, answered
+
+
+def _listen_loop(client, deadline, wait):
+    # Heartbeat once: presence flickers on. Best effort — a failed heartbeat
+    # never stops the poll loop, but an auth failure ends the run.
+    try:
+        call_with_retry(client.handshake, None, "handshake")
+        agent_name, principal_name = load_identity(client)
+        diag(f"listening as {agent_name} (principal: {principal_name})")
+        call_with_retry(client.heartbeat, None, "heartbeat")
+    except FilamentError as e:
+        if e.auth:
+            raise
+        diag(f"heartbeat failed ({e}) — continuing to poll anyway")
+
+    cursor = None
+    skip_ids = set()
+    while True:
+        # A live listener's lock never looks stale: polls are at most 60 s
+        # apart and staleness is 120 s of mtime.
+        _touch_lock()
+        remaining = deadline - time.time()
+        if remaining < 15:
+            # Deadline is near: one last immediate check (wait_seconds=0)
+            # so we never report "no work" without asking the server.
+            try:
+                inner = _poll(client, cursor, skip_ids, 0, None)
+            except FilamentError as e:
+                diag(f"final poll failed ({e})")
+                print(json.dumps({"work": []}))
+                return 3
+            fresh, _ = _split_work(inner.get("work") or [])
+            if fresh:
+                out = dict(inner)
+                out["work"] = fresh
+                print(json.dumps(out, indent=2))
+                return 0
+            print(json.dumps({"work": []}))
+            return 3
+        poll_wait = min(wait, remaining - 10, 60)
+        # the server validates wait_seconds as an integer
+        poll_wait = int(poll_wait)
+        if poll_wait < 1:
+            poll_wait = 1
+        inner = _poll(client, cursor, skip_ids, poll_wait, deadline)
+        cursor = inner.get("cursor", cursor)
+        fresh, answered = _split_work(inner.get("work") or [])
+        skip_ids.update(answered)
+        if fresh:
+            out = dict(inner)
+            out["work"] = fresh
+            print(json.dumps(out, indent=2))
+            return 0
+        if inner.get("truncated"):
+            continue
+        if answered and not fresh:
+            # 5-second floor: only already-answered items came back, so the
+            # server still hasn't consumed them. Until Filament fixes
+            # read-marking, sleeping next_poll_ms (~1 s) would spin a hot
+            # poll loop; sleep 5 s instead, capped to the time left.
+            sleep_s = min(5.0, deadline - time.time())
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            continue
+        sleep_s = (inner.get("next_poll_ms") or 1000) / 1000.0
+        if sleep_s > remaining:
+            sleep_s = remaining
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+
+def cmd_ensure():
+    """Front-door status check: alive, paused, or none. Never starts a listener."""
+    if os.path.exists(state_path("auth_failed")):
+        print(json.dumps({"listener": "paused"}))
+        return 0
+    content, age = _lock_info()
+    if content is not None and age < LOCK_ALIVE_SECONDS:
+        print(json.dumps({"listener": "alive"}))
+        return 0
+    print(json.dumps({"listener": "none"}))
+    return 0
+
+
+# -- entry ------------------------------------------------------------
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="filament", description="Filament agent CLI")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("listen", help="long-poll for work until the deadline")
+    pl.add_argument("--deadline", type=float, default=None,
+                    help="epoch seconds; loop ends 15s before")
+    pl.add_argument("--budget", type=float, default=None,
+                    help="sugar for --deadline now+seconds")
+    pl.add_argument("--hours", type=float, default=None,
+                    help="sugar for --deadline now+hours*3600 (front door)")
+    pl.add_argument("--wait", type=float, default=30,
+                    help="seconds per poll_work call (server max 60)")
+
+    pr = sub.add_parser("reply", help="make the reply_with tool call once")
+    pr.add_argument("--with", dest="with_json", required=True,
+                    help="the work item's reply_with JSON object")
+    pr.add_argument("--body", required=True, help="markdown reply body")
+    pr.add_argument("--for", dest="for_ids", default="",
+                    help="comma-separated messages[].event_id of the item; "
+                         "when all are already in replied.json the item is "
+                         "acked instead of answered twice")
+
+    pa = sub.add_parser("ack", help="consume items without replying")
+    pa.add_argument("event_ids", nargs="+")
+
+    pc = sub.add_parser("call", help="generic tools/call passthrough")
+    pc.add_argument("tool")
+    pc.add_argument("args_json")
+
+    sub.add_parser("self", help="print the agent's identity (get_self)")
+    sub.add_parser("hello", help="first-contact hello to the principal")
+    sub.add_parser("reset", help="clear state markers")
+    sub.add_parser("ensure", help="report the background listener state")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    if args.cmd == "reset":
+        for name in ("auth_failed", "alerted", "failures", "run.lock"):
+            try:
+                os.remove(state_path(name))
+            except OSError:
+                pass
+        print(json.dumps({"reset": True}))
+        return 0
+
+    client = Client()
+    try:
+        if args.cmd == "ensure":
+            return cmd_ensure()
+        if args.cmd == "listen":
+            deadline = args.deadline
+            if deadline is None:
+                if args.hours is not None:
+                    deadline = time.time() + args.hours * 3600
+                elif args.budget is None:
+                    ap.error("listen needs --deadline, --budget or --hours")
+                else:
+                    deadline = time.time() + args.budget
+            return cmd_listen(client, deadline, args.wait)
+        if args.cmd == "self":
+            return cmd_self(client)
+        if args.cmd == "call":
+            return cmd_call(client, args.tool, args.args_json)
+        if args.cmd == "hello":
+            return cmd_hello(client)
+        if args.cmd == "ack":
+            return cmd_ack(client, args.event_ids)
+        if args.cmd == "reply":
+            return cmd_reply(client, args.with_json, args.body, args.for_ids)
+    except FilamentError as e:
+        if e.auth:
+            write_state("auth_failed", str(int(time.time())))
+            who = getattr(client, "agent_name", None) or "the agent"
+            diag(f"authentication failed for {who}: {e}")
+            return 2
+        write_state("last_error", str(e))
+        diag(f"error: {e}")
+        return 1
+    except dc.DynamicCredentialError as e:
+        write_state("last_error", f"credential error: {e}")
+        diag(f"credential error: {e}")
+        return 1
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
