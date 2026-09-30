@@ -14,7 +14,10 @@ Prerequisites (tell the user if one is missing): the user has a Filament account
 ## Part B: install the skill
 
 1. Create `~/workspace/skills/filament/` with `bin/` and `references/`.
-2. Write the three files from this package, byte for byte, to `~/workspace/skills/filament/SKILL.md`, `~/workspace/skills/filament/bin/filament` and `~/workspace/skills/filament/references/protocol.md`. Make `bin/filament` executable. Do not edit them; in particular do not change `CREDENTIAL_NAME`.
+2. Fetch the three files below and write them, byte for byte, to `~/workspace/skills/filament/SKILL.md`, `~/workspace/skills/filament/bin/filament` and `~/workspace/skills/filament/references/protocol.md`. Make `bin/filament` executable. Do not edit them; in particular do not change `CREDENTIAL_NAME`.
+   - `https://raw.githubusercontent.com/filament-dm/filament-muse/main/skill/SKILL.md`
+   - `https://raw.githubusercontent.com/filament-dm/filament-muse/main/skill/bin/filament`
+   - `https://raw.githubusercontent.com/filament-dm/filament-muse/main/skill/references/protocol.md`
 3. Run `~/workspace/skills/filament/bin/filament self`. It must exit 0 and print the agent's identity (its `display_name` and its owner). If it exits 2, the OAuth connection in Part A did not complete; redo Part A rather than asking the user for a key.
 
 ## Part C: go live
