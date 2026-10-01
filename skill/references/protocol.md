@@ -1,6 +1,6 @@
 # Filament agents MCP — protocol facts
 
-Verified 30 Sep 2026 from inside a Muse VM. Enough detail here to re-derive `bin/filament`.
+Verified 30 Sep 2026 from inside this VM. Enough detail here to re-derive `bin/filament`.
 
 ## Endpoint
 - Base: `https://api.filament.dm/mcp/agents`. MCP Streamable HTTP, JSON-RPC 2.0, single POST to the base.
@@ -17,17 +17,17 @@ Verified 30 Sep 2026 from inside a Muse VM. Enough detail here to re-derive `bin
 ## poll_work
 `poll_work(cursor?, ack?, wait_seconds=30, max_items=10)`: blocks until work arrives or `wait_seconds` elapses (server max 60). Returns `{work: [{channel_id, thread_id, is_backchannel, messages: [{event_id, sender, body, ts}], reply_with: {tool, args} | null}], cursor, next_poll_ms, truncated, acknowledged}`.
 
-- **Work stays outstanding until it is replied to or acked — best-effort.** The `cursor` only narrows the server's scan and never consumes anything. So an item that was fetched but not answered comes back on the next poll, whatever cursor is passed. This is the crash-safety guarantee; the skill does not need its own. BUT server-side consumption is unreliable: the server's record of issued work is in memory per worker process (short life) and the API runs several workers, so a reply can post without consuming the item, which then comes back on the next poll — observed repeatedly on 30 Sep 2026. The skill therefore keeps its own record: `state/replied.json`, the last 1000 replied `event_id`s with timestamps (no expiry — an id answered once is never answered again while recorded).
-- One poll returns **one item per channel aggregating all outstanding messages**; `reply_with` targets the latest message in the item. Reply once per item, addressing everything in it.
-- Replying via `reply_with` usually marks the item read, **but only best-effort** — see the first bullet. A second reply to the same item is refused by the server when its record survives. So a reply is never retried, and before replying to any item the CLI checks whether every `event_id` in that item is already in `state/replied.json`; if so it **acks** the item instead of replying. Ids are recorded in `replied.json` after the handshake succeeds and immediately before the reply is sent: an unknown reply outcome (timeout, connection reset) counts as replied, so a repeat of the item is acked, not answered twice.
+- **Work stays outstanding until it is replied to or acked — best-effort.** The `cursor` only narrows the server's scan and never consumes anything. So an item that was fetched but not answered comes back on the next poll, whatever cursor is passed. This is the crash-safety guarantee; the skill does not need its own. BUT server-side consumption is unreliable: the server's record of issued work appears to be in memory per worker process (short life) and the API runs several workers, so a reply can post without consuming the item, which then comes back on the next poll — observed twice 30 Sep 2026 (~09:54–09:56 and ~10:04 EDT; in the second case a reply whose consumption was verified same-session AND cross-session resurfaced 4 minutes later). The skill therefore keeps its own record: `state/replied.json`, the last 1000 replied `event_id`s with timestamps (no expiry — an id answered once is never answered again while recorded).
+- One poll returns **one item per channel aggregating all outstanding messages**; `reply_with` targets the latest message in the item (verified 30 Sep 2026: four outstanding messages arrived as one item, `in_reply_to` = the newest). Reply once per item, addressing everything in it.
+- Replying via `reply_with` USUALLY marks the item read (verified same-session and cross-session on 30 Sep), **but only best-effort** — see the first bullet. **A second reply to the same item is refused by the server.** So a reply is never retried, and before replying to any item the CLI checks whether every `event_id` in that item is already in `state/replied.json`; if so it **acks** the item instead of replying. Ids are recorded in `replied.json` BEFORE the reply is sent: an unknown reply outcome (timeout, connection reset) counts as replied, so a repeat of the item is acked, not answered twice.
 - `listen` additionally filters client-side: an item whose every message id is in `state/replied.json` never ends the listen (it is skipped and its ids are offered as `ack` on subsequent polls). Without this, a resurfaced-but-answered item would make every `listen` exit 0 immediately in a tight loop.
-- `ack` takes message event ids for work decided NOT to answer. In testing (30 Sep 2026) the server returned `acknowledged: 0` on genuinely outstanding ids and the items kept coming back — the `ack` parameter appears non-functional against this beta. The client-side `replied.json` guard is the reliable duplicate suppression; the CLI still passes `ack` opportunistically.
+- `ack` takes message event ids for work decided NOT to answer. In testing (30 Sep 2026, twice, on genuinely outstanding ids) the server returned `acknowledged: 0` and the items kept coming back — the `ack` parameter appears non-functional against this beta. The client-side `replied.json` guard is the reliable duplicate suppression; the CLI still passes `ack` opportunistically.
 - `mark_read` called by the agent fails with JSON-RPC `-32603` ("Tool execution failed"); it is not part of the consumption flow.
 - `wait_seconds` must be an **integer**; fractional values are rejected with JSON-RPC `-32602` (the CLI casts to int).
 - Items with `reply_with: null` are consumed by the server on delivery. Skip them.
 - `truncated: true` means more work is pending: poll again immediately with the returned cursor (`next_poll_ms` will be 0).
 - When `poll_work` delivers work, the server sets a "reading a new message" status in that room. The agent's next `poll_work` call clears it; it expires by itself after 60 s. The reply does not clear it.
-- Verified: 30 s and 60 s waits both hold through Meta's egress proxy; a message sent to the backchannel returned from a waiting poll within ~1 s.
+- Verified: 30 s and 60 s waits both hold through Meta's egress proxy; a message sent to the backchannel returned from a waiting poll within ~1 s and the reply posted 6 s after the message.
 
 ## Reply tools
 - `post_message(channel, markdown_body, in_reply_to?)`, `reply_in_thread(message_id, markdown_body)`. `reply_with.args` already carries everything except `markdown_body`.
@@ -44,7 +44,7 @@ Scheduled jobs fire every 5 minutes on the second; a run may hold at least 10 mi
 
 Verified 30 Sep 2026: a command started in the background **from the chat** (exec `background: true`) survives between turns, and when it exits Muse receives a new turn carrying its full stdout ("Background exec command tool output"). This is the front door: a long-running `filament listen` in the background delivers work to Muse the moment it arrives. It dies on a VM restart, so the 5-minute job stays as the backstop.
 
-Also verified 30 Sep 2026: a process the CLI detaches itself is NOT tracked by the chat runtime — it runs, but its exit does **not** deliver a turn. `filament ensure` is therefore the status check only (`alive`/`paused`/`none`) and never starts a listener. From a chat turn, the front-door listener must be started via the background-exec form (`filament listen --hours 6 --wait 30` in the background).
+Also verified 30 Sep 2026: a process the CLI detaches itself (the old `filament ensure` detached start, since removed) is NOT tracked by the chat runtime — it runs fine, but its exit does **not** deliver a turn. `filament ensure` is now the status check only (`alive`/`paused`/`none`) and never starts a listener. From a chat turn, the front-door listener must be started via the background-exec form (`filament listen --hours 6 --wait 30` in the background).
 
 ## CLI contract (bin/filament)
 - Socket timeout: `wait_seconds + 15` for `poll_work`, 30 s for everything else.

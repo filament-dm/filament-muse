@@ -15,6 +15,7 @@ Make this Muse agent the user's Filament agent using Filament's agents MCP endpo
 - `filament reply --with '<reply_with json>' --body '<markdown>' --for '<event_id>[,<event_id>...]'` — make exactly the tool call named in `reply_with`, its `args` plus `markdown_body`. Never retried: the server refuses a second reply to the same item. Duplicate guard: if every id in `--for` is already in `state/replied.json` (last 1000 replied ids, no expiry), the CLI acks instead of replying and prints `{"acked": [...]}`. Ids are recorded before the reply is sent, so an unknown outcome counts as replied.
 - `filament ack <event_id> [...]` — consume items without replying (`poll_work(wait_seconds=0, ack=[...])`).
 - `filament call <tool> '<args json>'` — generic `tools/call` passthrough for context reads.
+- `filament media <mxc_url> [--out <path>]` — download a media attachment (GET on the media endpoint with the credential attached, follows redirects, refuses files over 20 MB) into `state/media/<sha1>.<ext>`; prints `{"path","bytes","content_type"}`. Exit 2 on 401 only; a 403/404/400 means the file is unavailable (exit 1, `last_error`), and never touches `auth_failed`.
 - `filament ensure` — front-door status check. Prints `{"listener": "paused"}` if `state/auth_failed` exists, `{"listener": "alive"}` if a listener's lock is fresh, `{"listener": "none"}` otherwise. It never starts a listener.
 - `filament self` — the agent's identity (`get_self`). `filament hello` — first-contact hello to the principal (run once, manually). `filament reset` — clear state markers.
 
@@ -36,7 +37,8 @@ A 401 or 403 is a question about the request before it is a question about the k
 6. A reply is never retried (the server refuses second replies). Always pass `--for` with the item's message event ids so the duplicate guard can suppress a repeat: if the item comes back, the CLI acks it instead of answering twice. On an unknown reply outcome the ids stay recorded — poll again and let the next `listen` decide; a repeat is acked, not reposted.
 7. Work stays outstanding until replied to or acked; the cursor never consumes anything. Items with `reply_with: null` are consumed by the server on delivery — skip them.
 8. One poll returns one item per channel aggregating all outstanding messages; `reply_with` targets the latest message. Reply once per item, addressing everything in it.
-9. If the user has chosen Filament as the channel for your own messages, a backchannel message that answers a question you asked there is an answer to act on, not a request to reply to. Act on it, and reply only if the action produces something to report.
+9. A backchannel message that answers a question you asked there is an answer to act on, not a request to reply to. Act on it, and reply only if the action produces something to report.
+10. When a message in a work item has a media field, run `filament media` on each entry (at most three per item), open images with `muse.read` before composing your reply, read small text files, and name anything else by filename and type. Delete the downloaded files after replying. Never post a raw mxc url or a local path where people can read it.
 
 ## Front door: the background listener (primary path)
 

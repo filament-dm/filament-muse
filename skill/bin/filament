@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Filament agent CLI for Muse.
 
-Subcommands: listen, reply, ack, call, self, hello, reset, ensure.
+Subcommands: listen, reply, ack, call, self, hello, reset, ensure, media.
 Prints one JSON object to stdout; diagnostics to stderr.
 Exit codes: 0 = success / work found; 3 = no work before the deadline;
             2 = authentication failure; 1 = any other error after retries.
@@ -11,6 +11,7 @@ See SKILL.md and references/protocol.md.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -38,6 +39,27 @@ LOCK_ALIVE_SECONDS = 120
 # work state is best-effort, so an id answered once is never answered again
 # while it is still recorded here).
 REPLIED_MAX = 1000
+# Attachment downloads: refuse anything over this many bytes.
+MAX_MEDIA_BYTES = 20 * 1024 * 1024
+# state/media/ file extension by Content-Type, when the server sends one.
+CONTENT_TYPE_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+    "image/svg+xml": "svg",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
+    "audio/mpeg": "mp3",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "application/json": "json",
+}
 
 
 def diag(msg):
@@ -340,6 +362,86 @@ def cmd_ack(client, event_ids):
     return 0
 
 
+def _media_extension(content_type, mxc_url):
+    """File extension for a downloaded attachment.
+
+    Prefers the response Content-Type; falls back to the mxc url's filename;
+    last resort is 'bin'.
+    """
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype in CONTENT_TYPE_EXT:
+        return CONTENT_TYPE_EXT[ctype]
+    name = urllib.parse.urlparse(mxc_url).path.rsplit("/", 1)[-1]
+    if "." in name:
+        ext = name.rsplit(".", 1)[-1].lower()
+        if ext.isalnum() and len(ext) <= 5:
+            return ext
+    return "bin"
+
+
+def cmd_media(mxc_url, out_path):
+    """Download a media attachment by mxc url.
+
+    GETs the media endpoint with the credential attached, follows redirects,
+    and writes the raw bytes to state/media/<sha1>.<ext> (or --out).
+    Refuses files over MAX_MEDIA_BYTES. Prints the saved path, byte count
+    and content type as JSON.
+    """
+    if not mxc_url.startswith("mxc://"):
+        raise FilamentError(f"not an mxc url: {mxc_url}")
+    query = urllib.parse.urlencode({"mxc_url": mxc_url})
+    req = urllib.request.Request(BASE_URL + "/media?" + query, method="GET")
+    dc.add_surrogate_to_request(req, CREDENTIAL_NAME,
+                                allowed_hosts=ALLOWED_HOSTS)
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        # Only 401 means the credential was rejected. A 403/404/400 from
+        # the media endpoint means the file itself is unavailable — a plain
+        # failure (exit 1, last_error), never an auth failure: it must not
+        # touch state/auth_failed or pause the listener.
+        if e.code == 401:
+            raise FilamentError("HTTP 401 from media endpoint", auth=True)
+        raise FilamentError(f"media download: HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise FilamentError(f"media download: network error: {e}")
+    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+    length = resp.headers.get("Content-Length")
+    if length:
+        try:
+            if int(length) > MAX_MEDIA_BYTES:
+                raise FilamentError(
+                    f"media file too large ({length} bytes > 20 MB)")
+        except ValueError:
+            pass
+    total = 0
+    chunks = []
+    while True:
+        try:
+            chunk = resp.read(65536)
+        except OSError as e:
+            raise FilamentError(f"media download: read error: {e}")
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_MEDIA_BYTES:
+            raise FilamentError("media file too large (> 20 MB)")
+        chunks.append(chunk)
+    if out_path:
+        path = out_path
+    else:
+        digest = hashlib.sha1(mxc_url.encode("utf-8")).hexdigest()
+        ext = _media_extension(content_type, mxc_url)
+        media_dir = os.path.join(STATE_DIR, "media")
+        os.makedirs(media_dir, exist_ok=True)
+        path = os.path.join(media_dir, f"{digest}.{ext}")
+    with open(path, "wb") as f:
+        f.write(b"".join(chunks))
+    print(json.dumps({"path": os.path.abspath(path), "bytes": total,
+                      "content_type": content_type or None}))
+    return 0
+
+
 def cmd_reply(client, with_json, body, for_ids):
     try:
         rw = json.loads(with_json)
@@ -465,6 +567,59 @@ def _split_work(work):
     return fresh, answered
 
 
+def _result_messages(result):
+    """Pull a message list out of a parsed tool result, defensively."""
+    inner = parse_tool_result(result)
+    if isinstance(inner, dict):
+        msgs = inner.get("messages")
+        return msgs if isinstance(msgs, list) else []
+    return inner if isinstance(inner, list) else []
+
+
+def _enrich_media(client, items, deadline):
+    """Attach media lists from the read tools onto work item messages.
+
+    poll_work does not include attachments; get_recent_messages and
+    get_thread do. For each item, read the channel's recent messages (and
+    the thread root when thread_id is set) and copy any media list onto
+    the item message with the matching event_id.
+    """
+    for item in items:
+        channel = item.get("channel_id")
+        if not channel:
+            continue
+        candidates = []
+        try:
+            result = call_with_retry(
+                lambda: client.tool_call(
+                    "get_recent_messages", {"channel": channel, "limit": 25}),
+                deadline, "get_recent_messages")
+            candidates.extend(_result_messages(result))
+            thread_id = item.get("thread_id")
+            if thread_id:
+                result = call_with_retry(
+                    lambda: client.tool_call("get_thread",
+                                             {"message_id": thread_id}),
+                    deadline, "get_thread")
+                candidates.extend(_result_messages(result))
+        except FilamentError as e:
+            if e.auth:
+                raise
+            diag(f"media enrichment failed ({e}) — continuing without media")
+            continue
+        media_by_id = {}
+        for m in candidates:
+            if (isinstance(m, dict) and m.get("event_id")
+                    and m.get("media")):
+                media_by_id[m["event_id"]] = m["media"]
+        if not media_by_id:
+            continue
+        for m in item.get("messages", []):
+            if (isinstance(m, dict)
+                    and m.get("event_id") in media_by_id):
+                m["media"] = media_by_id[m["event_id"]]
+
+
 def _listen_loop(client, deadline, wait):
     # Heartbeat once: presence flickers on. Best effort — a failed heartbeat
     # never stops the poll loop, but an auth failure ends the run.
@@ -496,6 +651,7 @@ def _listen_loop(client, deadline, wait):
                 return 3
             fresh, _ = _split_work(inner.get("work") or [])
             if fresh:
+                _enrich_media(client, fresh, None)
                 out = dict(inner)
                 out["work"] = fresh
                 print(json.dumps(out, indent=2))
@@ -512,6 +668,7 @@ def _listen_loop(client, deadline, wait):
         fresh, answered = _split_work(inner.get("work") or [])
         skip_ids.update(answered)
         if fresh:
+            _enrich_media(client, fresh, deadline)
             out = dict(inner)
             out["work"] = fresh
             print(json.dumps(out, indent=2))
@@ -580,6 +737,11 @@ def build_parser():
     pc.add_argument("tool")
     pc.add_argument("args_json")
 
+    pm = sub.add_parser("media", help="download a media attachment by mxc url")
+    pm.add_argument("mxc_url")
+    pm.add_argument("--out", default=None,
+                    help="write to this path instead of state/media/")
+
     sub.add_parser("self", help="print the agent's identity (get_self)")
     sub.add_parser("hello", help="first-contact hello to the principal")
     sub.add_parser("reset", help="clear state markers")
@@ -623,6 +785,8 @@ def main(argv=None):
             return cmd_hello(client)
         if args.cmd == "ack":
             return cmd_ack(client, args.event_ids)
+        if args.cmd == "media":
+            return cmd_media(args.mxc_url, args.out)
         if args.cmd == "reply":
             return cmd_reply(client, args.with_json, args.body, args.for_ids)
     except FilamentError as e:
