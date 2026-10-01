@@ -41,11 +41,13 @@ A 401 or 403 is a question about the request before it is a question about the k
 8. One poll returns one item per channel aggregating all outstanding messages; `reply_with` targets the latest message. Reply once per item, addressing everything in it.
 9. A backchannel message that answers a question you asked there is an answer to act on, not a request to reply to. Act on it, and reply only if the action produces something to report.
 10. When a message in a work item has a media field, run `filament media` on each entry (at most three per item), open images with `muse.read` before composing your reply, read small text files, and name anything else by filename and type. Delete the downloaded files after replying. Never post a raw mxc url or a local path where people can read it.
+11. Silence is a valid reply. If nothing in an item is addressed to you or needs anything from you (for example, a group-chat message aimed at someone else), run `filament ack` on the item's event ids and post nothing. Never post that you are staying quiet or that a message was not meant for you: that is itself a reply.
+12. Pass `--body` as plain text with the real characters (dashes, curly quotes, emoji). Never JSON-escape it or write `\u`-style escapes; they reach Filament literally.
 
 ## Front door: the background listener (primary path)
 
 1. **Start.** From a chat turn, run `filament listen --hours 6 --wait 30 &` in the background. End the turn. Tell the user in one line that the agent is listening on Filament. Do this when the user asks to "connect", "listen", "start the agent", and whenever a turn begins and `filament ensure` does not report "alive" (so a VM restart is healed the next time the user talks to Muse).
-2. **Work arrives.** The listener exits 0 and its stdout (the `poll_work` result) arrives as a new turn. Handle every item exactly as the Job Contract's step 4 says (context for non-backchannel rooms, one short reply per item as the agent, `filament reply --with ... --body ... --for ...`, skip items the CLI acks). Then immediately run `filament listen --hours 6 --wait 30 &` again and end the turn. Say nothing to the user about it: no summary, no "replied on Filament", nothing in the Muse chat. The Filament reply is the output.
+2. **Work arrives.** The listener exits 0 and its stdout (the `poll_work` result) arrives as a new turn. Handle every item exactly as the Job Contract's step 4 says (context for non-backchannel rooms, one short reply per item as the agent unless nothing in it is for you, `filament reply --with ... --body ... --for ...`, skip items the CLI acks). Then immediately run `filament listen --hours 6 --wait 30 &` again and end the turn. Say nothing to the user about it: no summary, no "replied on Filament", nothing in the Muse chat. The Filament reply is the output.
 3. **Deadline reached (exit 3).** Restart the listener in the background and end the turn silently.
 4. **Auth failure (exit 2).** Follow the Job Contract's step 6 (one message to the user, `state/alerted`, pause the job). Do not restart the listener.
 5. **Other failure (exit 1).** Wait 30 s, restart the listener, increment `state/failures`; at 3 consecutive failures message the user once (step 7 rules), keep trying.
@@ -61,7 +63,8 @@ A 401 or 403 is a question about the request before it is a question about the k
 4. Exit 0: for each item in `work`, in order, while `now < DEADLINE - 20`:
    - `reply_with` null: skip.
    - Not `is_backchannel`: `filament call get_recent_messages '{"channel": <channel_id>, "limit": 25}'`; if `thread_id` is set, also `filament call get_thread '{"message_id": <thread_id>}'`.
-   - Compose a short markdown reply as the agent. Never speak as the user. Never write raw ids. If the ask is unclear, reply with a one-line clarifying question in the same place.
+   - If nothing in the item is addressed to you or needs anything from you: `filament ack <the item's event ids>`, post nothing, move on (rule 11).
+   - Compose a short markdown reply as the agent, in plain text with real characters (rule 12). Never speak as the user. Never write raw ids. If the ask is unclear, reply with a one-line clarifying question in the same place.
    - `filament reply --with '<reply_with>' --body '<reply>' --for '<the item's event ids>'`. Exit 1: do not retry; move on. If the CLI reports it acked instead of replying, that item was already answered: skip it silently.
    - Items not reached before the deadline are left alone; they come back next run.
 5. After the loop, go to step 2 (same `DEADLINE`, never renewed). The `listen` call that follows a reply is what clears the "reading" status on Filament.
