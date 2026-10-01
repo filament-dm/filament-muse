@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Filament agent CLI for Muse.
 
-Subcommands: listen, reply, ack, call, self, hello, reset, ensure, media.
+Subcommands: listen, reply, ack, call, self, hello, reset, ensure, media,
+profile.
 Prints one JSON object to stdout; diagnostics to stderr.
 Exit codes: 0 = success / work found; 3 = no work before the deadline;
             2 = authentication failure; 1 = any other error after retries.
@@ -12,13 +13,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
+import re
 import signal
 import sys
 import time
 import urllib.error
 import urllib.request
+
+try:
+    from PIL import Image, ImageChops
+    HAVE_PIL = True
+except ImportError:  # Pillow is only needed for the profile head-shot crop
+    HAVE_PIL = False
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 import dynamic_credentials as dc
@@ -41,6 +50,17 @@ LOCK_ALIVE_SECONDS = 120
 REPLIED_MAX = 1000
 # Attachment downloads: refuse anything over this many bytes.
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
+# Avatar/profile sync: refuse anything over this many bytes, and only these
+# image types are ever uploaded (the .mp4 animated variants in the same
+# directory must never be uploaded as a profile image).
+MAX_PROFILE_BYTES = 5 * 1024 * 1024
+PROFILE_IMAGE_TYPES = {
+    ".webp": "image/webp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+}
+UPLOAD_URL = "https://api.filament.dm/mcp/agents/upload"
+AVATAR_DIR = os.path.expanduser("~/workspace/avatars")
 # state/media/ file extension by Content-Type, when the server sends one.
 CONTENT_TYPE_EXT = {
     "image/png": "png",
@@ -442,6 +462,251 @@ def cmd_media(mxc_url, out_path):
     return 0
 
 
+def _newest_avatar_webp():
+    """Newest avatar-<digits>-<n>.webp in ~/workspace/avatars, or None.
+
+    Only files literally named avatar-<digits>-<n>.webp qualify — every
+    other image name in the directory (face crops, headshots, edit
+    candidates, .mp4 variants) is ignored. This is the last-resort
+    fallback; the active avatar pointer (runtime.avatar_state.image_path,
+    read via the avatar tools) always wins when the operator has it.
+    """
+    best = None
+    try:
+        names = os.listdir(AVATAR_DIR)
+    except OSError:
+        return None
+    for name in names:
+        if not re.fullmatch(r"avatar-\d+-\d+\.webp", name):
+            continue
+        path = os.path.join(AVATAR_DIR, name)
+        try:
+            if not os.path.isfile(path):
+                continue
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, path)
+    return best[1] if best else None
+
+
+def _upload_bytes(body, filename, ctype):
+    """POST raw bytes to the upload endpoint; return the mxc url.
+
+    Sends the credential and the given Content-Type. A 401/403 is an auth
+    failure; anything else is a plain failure.
+    """
+    query = urllib.parse.urlencode({"filename": filename})
+    req = urllib.request.Request(
+        UPLOAD_URL + "?" + query, data=body, method="POST",
+        headers={"Content-Type": ctype, "Accept": "application/json"})
+    dc.add_surrogate_to_request(req, CREDENTIAL_NAME,
+                                allowed_hosts=ALLOWED_HOSTS)
+    try:
+        resp = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise FilamentError(f"HTTP {e.code} from upload endpoint",
+                                auth=True)
+        raise FilamentError(f"avatar upload: HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise FilamentError(f"avatar upload: network error: {e}")
+    raw = dc.read_response_body(resp)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise FilamentError(f"avatar upload: bad JSON response: {e}")
+    mxc = data.get("mxc_url") if isinstance(data, dict) else None
+    if not mxc:
+        raise FilamentError(f"avatar upload: no mxc_url in response: {data!r}")
+    return mxc
+
+
+def _check_avatar_source(path):
+    """Validate an avatar source file for `profile`; return its Content-Type.
+
+    Applies to both the cropped and the --no-crop paths: the 5 MB guard
+    keeps the CLI from rasterizing a huge file.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    ctype = PROFILE_IMAGE_TYPES.get(ext)
+    if not ctype:
+        raise FilamentError(
+            f"refusing upload of {os.path.basename(path)}: not a profile "
+            "image type (.webp/.png/.jpg only, never .mp4)")
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise FilamentError(f"avatar file unreadable: {e}")
+    if size > MAX_PROFILE_BYTES:
+        raise FilamentError(
+            f"avatar too large ({size} bytes > 5 MB): "
+            f"{os.path.basename(path)}")
+    return ctype
+
+
+# Automatic head-shot crop: fractions of the subject's bounding-box height.
+# Loosened 2026-10-01 per operator request (was -0.05/0.29, tuned to match
+# the hand-picked (560,120)-(1000,560) face crop). TOP_PCT is negative
+# because a face crop starts just below the hair top, the subject top.
+HEAD_CROP_TOP_PCT = -0.04  # head box top sits this far above (+) or below
+                           # (-) the subject top, in subject heights
+HEAD_CROP_SIDE_PCT = 0.35  # head box side length, in subject heights
+HEADSHOT_SIZE = 512        # cropped avatars are resized to this square
+
+
+def _subject_bbox(img):
+    """Bounding box of the non-background subject, or None.
+
+    Uses the alpha channel when the image has one; otherwise treats the
+    most common corner colour as the background and takes every pixel
+    that differs from it by more than a small tolerance.
+    """
+    if img.mode in ("RGBA", "LA") or (img.mode == "P"
+                                      and "transparency" in img.info):
+        alpha = img.convert("RGBA").split()[3]
+        return alpha.point(lambda v: 255 if v > 16 else 0).getbbox()
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    corners = [rgb.getpixel(p)
+               for p in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))]
+    bg = max(set(corners), key=corners.count)
+    diff = ImageChops.difference(rgb, Image.new("RGB", (w, h), bg))
+    channels = [ch.point(lambda v: 255 if v > 30 else 0)
+                for ch in diff.split()]
+    mask = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]),
+                              channels[2])
+    return mask.getbbox()
+
+
+def _head_box(bbox, img_size):
+    """Square head-shot box from a subject bounding box.
+
+    The square's top edge sits HEAD_CROP_TOP_PCT of the subject height
+    above the subject's top; it is centred on the subject's horizontal
+    centre with side HEAD_CROP_SIDE_PCT of the subject height, clamped
+    to the image. Returns (x, y, w, h).
+    """
+    x0, y0, x1, y1 = bbox
+    img_w, img_h = img_size
+    subj_h = y1 - y0
+    subj_cx = (x0 + x1) / 2.0
+    side = min(HEAD_CROP_SIDE_PCT * subj_h, img_w, img_h)
+    left = min(max(subj_cx - side / 2.0, 0), img_w - side)
+    top = min(max(y0 - HEAD_CROP_TOP_PCT * subj_h, 0), img_h - side)
+    x, y, s = int(round(left)), int(round(top)), int(round(side))
+    return (x, y, s, s)
+
+
+def _parse_crop(spec, img_size):
+    """Parse --crop x,y,w,h (source-image pixels) into a clamped box."""
+    try:
+        x, y, w, h = (int(v) for v in spec.split(","))
+    except ValueError:
+        raise FilamentError(f"bad --crop {spec!r}: want x,y,w,h integers")
+    if w <= 0 or h <= 0:
+        raise FilamentError(f"bad --crop {spec!r}: w and h must be positive")
+    img_w, img_h = img_size
+    x = min(max(x, 0), img_w - 1)
+    y = min(max(y, 0), img_h - 1)
+    w = min(w, img_w - x)
+    h = min(h, img_h - y)
+    return (x, y, w, h)
+
+
+def cmd_profile(client, avatar_path, about, crop_spec, no_crop):
+    """Sync the avatar (and optionally the about text) to the agent's profile.
+
+    Unless --no-crop is given, the image is cropped to a head shot before
+    upload: --crop x,y,w,h overrides the box, otherwise the box is found
+    automatically (alpha channel when present, else the non-background
+    region). The crop is resized to 512x512 PNG, uploaded, and a copy is
+    saved to state/media/avatar-preview.png. The box used is printed.
+    set_profile is then called with the mxc url as `image` (plus `about`
+    when given). The display name is never touched: the user chose it in
+    Filament.
+    """
+    if crop_spec and no_crop:
+        raise FilamentError("--crop and --no-crop are mutually exclusive")
+    if avatar_path:
+        path = os.path.expanduser(avatar_path)
+        if not os.path.isfile(path):
+            raise FilamentError(f"avatar file not found: {avatar_path}")
+    else:
+        # No explicit pointer: fall back to the newest selected-avatar
+        # webp. The runtime's active-avatar pointer
+        # (runtime.avatar_state.image_path) is not readable from this
+        # sandbox, so the operator resolves it via the avatar tools and
+        # passes it as --avatar; this fallback is only for runs where the
+        # pointer isn't available.
+        path = _newest_avatar_webp()
+        if path is None:
+            raise FilamentError(
+                f"no avatar-<digits>-<n>.webp in {AVATAR_DIR}")
+        diag(f"no --avatar given; using newest selected-avatar webp: "
+             f"{os.path.basename(path)}")
+    crop_box = None
+    preview_path = None
+    if no_crop:
+        ctype = _check_avatar_source(path)
+        with open(path, "rb") as f:
+            body = f.read()
+        filename = os.path.basename(path)
+        diag("no crop requested; uploading the original file")
+    else:
+        if not HAVE_PIL:
+            raise FilamentError(
+                "head-shot cropping needs the Pillow package "
+                "(pip install pillow); use --no-crop to skip cropping")
+        _check_avatar_source(path)
+        with Image.open(path) as img:
+            if crop_spec:
+                box = _parse_crop(crop_spec, img.size)
+            else:
+                bbox = _subject_bbox(img)
+                if bbox is None:
+                    raise FilamentError(
+                        "no subject found for the automatic head-shot crop "
+                        "(image is all background): pass --crop x,y,w,h or "
+                        "--no-crop")
+                box = _head_box(bbox, img.size)
+            x, y, w, h = box
+            shot = img.convert("RGB").crop((x, y, x + w, y + h)).resize(
+                (HEADSHOT_SIZE, HEADSHOT_SIZE), Image.LANCZOS)
+        buf = io.BytesIO()
+        shot.save(buf, "PNG")
+        body = buf.getvalue()
+        stem = os.path.splitext(os.path.basename(path))[0]
+        filename = stem + "-headshot.png"
+        preview_path = os.path.join(STATE_DIR, "media", "avatar-preview.png")
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        with open(preview_path, "wb") as f:
+            f.write(body)
+        crop_box = [x, y, w, h]
+        ctype = "image/png"
+        diag(f"crop box (x,y,w,h): {x},{y},{w},{h} "
+             f"-> preview {preview_path}")
+    mxc = _upload_bytes(body, filename, ctype)
+    arguments = {"image": mxc}
+    if about is not None:
+        arguments["about"] = about
+    call_with_retry(client.handshake, None, "handshake")
+    result = call_with_retry(lambda: client.tool_call("set_profile",
+                                                      arguments),
+                             None, "set_profile")
+    print(json.dumps({"source": os.path.basename(path),
+                      "uploaded": filename,
+                      "bytes": len(body),
+                      "content_type": ctype,
+                      "crop_box": crop_box,
+                      "preview": (os.path.abspath(preview_path)
+                                  if preview_path else None),
+                      "mxc_url": mxc,
+                      "profile": parse_tool_result(result)}, indent=2))
+    return 0
+
+
 def cmd_reply(client, with_json, body, for_ids):
     try:
         rw = json.loads(with_json)
@@ -742,6 +1007,24 @@ def build_parser():
     pm.add_argument("--out", default=None,
                     help="write to this path instead of state/media/")
 
+    pp = sub.add_parser("profile",
+                        help="sync the avatar image (and about text) to the "
+                             "agent's profile")
+    pp.add_argument("--avatar", default=None,
+                    help="image to upload (.webp/.png/.jpg, max 5 MB). "
+                         "Pass the runtime's active-avatar pointer here "
+                         "(runtime.avatar_state.image_path, via avatar.get). "
+                         "Without it, the CLI falls back to the newest "
+                         "avatar-<digits>-<n>.webp in ~/workspace/avatars.")
+    pp.add_argument("--about", default=None,
+                    help="about/bio text to set on the profile")
+    pp.add_argument("--crop", default=None, metavar="X,Y,W,H",
+                    help="override the automatic head-shot box: crop box in "
+                         "source-image pixels, resized to 512x512 PNG")
+    pp.add_argument("--no-crop", action="store_true",
+                    help="upload the original file without head-shot "
+                         "cropping")
+
     sub.add_parser("self", help="print the agent's identity (get_self)")
     sub.add_parser("hello", help="first-contact hello to the principal")
     sub.add_parser("reset", help="clear state markers")
@@ -787,6 +1070,9 @@ def main(argv=None):
             return cmd_ack(client, args.event_ids)
         if args.cmd == "media":
             return cmd_media(args.mxc_url, args.out)
+        if args.cmd == "profile":
+            return cmd_profile(client, args.avatar, args.about,
+                               args.crop, args.no_crop)
         if args.cmd == "reply":
             return cmd_reply(client, args.with_json, args.body, args.for_ids)
     except FilamentError as e:
