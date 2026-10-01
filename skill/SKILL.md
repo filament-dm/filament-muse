@@ -36,6 +36,7 @@ A 401 or 403 is a question about the request before it is a question about the k
 6. A reply is never retried (the server refuses second replies). Always pass `--for` with the item's message event ids so the duplicate guard can suppress a repeat: if the item comes back, the CLI acks it instead of answering twice. On an unknown reply outcome the ids stay recorded — poll again and let the next `listen` decide; a repeat is acked, not reposted.
 7. Work stays outstanding until replied to or acked; the cursor never consumes anything. Items with `reply_with: null` are consumed by the server on delivery — skip them.
 8. One poll returns one item per channel aggregating all outstanding messages; `reply_with` targets the latest message. Reply once per item, addressing everything in it.
+9. If the user has chosen Filament as the channel for your own messages, a backchannel message that answers a question you asked there is an answer to act on, not a request to reply to. Act on it, and reply only if the action produces something to report.
 
 ## Front door: the background listener (primary path)
 
