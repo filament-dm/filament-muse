@@ -351,7 +351,7 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(polls[1]["ack"], ["answered"])
         self.assertEqual(polls[1]["cursor"], "next")
         reads = [args for name, args, _ in client.calls if name == "get_recent_messages"]
-        self.assertEqual(reads, [{"channel": "room", "limit": 40}])
+        self.assertEqual(reads, [{"channel": "room", "limit": 15}])
         self.assertEqual(set(filament._load_replied()), {"answered"})
         self.sleep.assert_not_called()
 
