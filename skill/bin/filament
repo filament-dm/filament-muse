@@ -48,6 +48,15 @@ LOCK_ALIVE_SECONDS = 120
 # work state is best-effort, so an id answered once is never answered again
 # while it is still recorded here).
 REPLIED_MAX = 1000
+CONTEXT_LIMIT = 40
+CONTEXT_LIMIT_BACKCHANNEL = 100
+CONTEXT_KEYS = (
+    "event_id", "sender", "body", "ts", "media", "is_from_self",
+    "is_from_principal", "is_from_agent", "thread_id",
+)
+CONTEXT_BODY_LIMIT = 2000
+THREAD_LIMIT = 50
+CONTEXT_OUTPUT_BYTES = 400_000
 # Attachment downloads: refuse anything over this many bytes.
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 # Avatar/profile sync: refuse anything over this many bytes, and only these
@@ -847,8 +856,10 @@ def _split_work(work):
     replied = _load_replied()
     fresh, answered = [], set()
     for item in work:
+        if not isinstance(item, dict):
+            continue
         ids = [m.get("event_id") for m in item.get("messages", [])
-               if m.get("event_id")]
+               if isinstance(m, dict) and m.get("event_id")]
         if ids and all(i in replied for i in ids):
             answered.update(ids)
         else:
@@ -865,37 +876,81 @@ def _result_messages(result):
     return inner if isinstance(inner, list) else []
 
 
-def _enrich_media(client, items, deadline):
-    """Attach media lists from the read tools onto work item messages.
+def _context_messages(messages, own_messages=()):
+    """Merge by event id, keep permitted fields and sort oldest first."""
+    merged, by_id = [], {}
+    for source in (messages, own_messages):
+        for message in source:
+            if not isinstance(message, dict):
+                continue
+            fields = {key: message[key] for key in CONTEXT_KEYS if key in message}
+            event_id = message.get("event_id")
+            if event_id and event_id in by_id:
+                by_id[event_id].update(fields)
+            else:
+                merged.append(fields)
+                if event_id:
+                    by_id[event_id] = fields
+    merged.sort(key=lambda m: m.get("ts") if isinstance(m.get("ts"), (int, float))
+                else 0)
+    for message in merged:
+        body = message.get("body")
+        if isinstance(body, str) and len(body) > CONTEXT_BODY_LIMIT:
+            message["body"] = body[:CONTEXT_BODY_LIMIT] + " […]"
+            message["truncated"] = True
+    return merged
 
-    poll_work does not include attachments; get_recent_messages and
-    get_thread do. For each item, read the channel's recent messages (and
-    the thread root when thread_id is set) and copy any media list onto
-    the item message with the matching event_id.
-    """
+
+def _enrich_items(client, items, deadline):
+    """Attach room/thread history and copy media from successful reads."""
     for item in items:
+        if not isinstance(item, dict):
+            continue
         channel = item.get("channel_id")
         if not channel:
+            item["context"] = []
+            item["context_error"] = "item has no channel_id"
+            diag(item["context_error"])
             continue
         candidates = []
         try:
+            def read_room():
+                _touch_lock()
+                return client.tool_call("get_recent_messages", {
+                    "channel": channel,
+                    "limit": (CONTEXT_LIMIT_BACKCHANNEL if item.get("is_backchannel")
+                              else CONTEXT_LIMIT),
+                })
             result = call_with_retry(
-                lambda: client.tool_call(
-                    "get_recent_messages", {"channel": channel, "limit": 25}),
-                deadline, "get_recent_messages")
+                read_room, deadline, "get_recent_messages")
             candidates.extend(_result_messages(result))
-            thread_id = item.get("thread_id")
-            if thread_id:
-                result = call_with_retry(
-                    lambda: client.tool_call("get_thread",
-                                             {"message_id": thread_id}),
-                    deadline, "get_thread")
-                candidates.extend(_result_messages(result))
+            item["context"] = _context_messages(candidates, item.get("messages", []))
+            inner = parse_tool_result(result)
+            if isinstance(inner, dict) and "cursor" in inner:
+                item["context_cursor"] = inner["cursor"]
         except FilamentError as e:
             if e.auth:
                 raise
-            diag(f"media enrichment failed ({e}) — continuing without media")
-            continue
+            item["context"] = []
+            item["context_error"] = str(e)
+            diag(f"room context read failed ({e}) - continuing")
+        thread_id = item.get("thread_id")
+        if thread_id:
+            try:
+                def read_thread():
+                    _touch_lock()
+                    return client.tool_call("get_thread", {"message_id": thread_id})
+                result = call_with_retry(
+                    read_thread, deadline, "get_thread")
+                messages = _result_messages(result)
+                candidates.extend(messages)
+                item["thread"] = _context_messages(messages)[-THREAD_LIMIT:]
+            except FilamentError as e:
+                if e.auth:
+                    raise
+                item["thread"] = []
+                item["thread_error"] = str(e)
+                diag(f"thread context read failed ({e}) - continuing")
         media_by_id = {}
         for m in candidates:
             if (isinstance(m, dict) and m.get("event_id")
@@ -907,6 +962,29 @@ def _enrich_media(client, items, deadline):
             if (isinstance(m, dict)
                     and m.get("event_id") in media_by_id):
                 m["media"] = media_by_id[m["event_id"]]
+
+
+def _trim_context(out):
+    """Drop oldest context entries round-robin to meet the output budget."""
+    if len(json.dumps(out).encode("utf-8")) <= CONTEXT_OUTPUT_BYTES:
+        return
+    out["context_trimmed"] = True
+    size = len(json.dumps(out).encode("utf-8"))
+    while size > CONTEXT_OUTPUT_BYTES:
+        removed = False
+        for item in out["work"]:
+            context = item.get("context", [])
+            if not context:
+                continue
+            message = context.pop(0)
+            size -= len(json.dumps(message).encode("utf-8")) + (2 if context else 0)
+            removed = True
+            if size <= CONTEXT_OUTPUT_BYTES:
+                return
+        if not removed:
+            # The original work and thread data must never be dropped.
+            diag("output exceeds context budget after all room context was removed")
+            return
 
 
 def _listen_loop(client, deadline, wait):
@@ -940,10 +1018,11 @@ def _listen_loop(client, deadline, wait):
                 return 3
             fresh, _ = _split_work(inner.get("work") or [])
             if fresh:
-                _enrich_media(client, fresh, None)
+                _enrich_items(client, fresh, time.time() + 20)
                 out = dict(inner)
                 out["work"] = fresh
-                print(json.dumps(out, indent=2))
+                _trim_context(out)
+                print(json.dumps(out))
                 return 0
             print(json.dumps({"work": []}))
             return 3
@@ -957,10 +1036,11 @@ def _listen_loop(client, deadline, wait):
         fresh, answered = _split_work(inner.get("work") or [])
         skip_ids.update(answered)
         if fresh:
-            _enrich_media(client, fresh, deadline)
+            _enrich_items(client, fresh, deadline)
             out = dict(inner)
             out["work"] = fresh
-            print(json.dumps(out, indent=2))
+            _trim_context(out)
+            print(json.dumps(out))
             return 0
         if inner.get("truncated"):
             continue
