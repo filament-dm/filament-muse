@@ -373,6 +373,9 @@ def cmd_hello(client):
 
 
 def cmd_ack(client, event_ids):
+    # A skipped item is handled like an answered one: if the server's ack does
+    # not take, the duplicate guard in listen filters the item when it resurfaces.
+    _record_replied(event_ids)
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(
         lambda: client.tool_call("poll_work",
