@@ -53,6 +53,7 @@ CONTEXT_LIMIT_BACKCHANNEL = 100
 CONTEXT_KEYS = (
     "event_id", "sender", "body", "ts", "media", "is_from_self",
     "is_from_principal", "is_from_agent", "thread_id",
+    "is_implicitly_mentioned", "reply_expected",
 )
 CONTEXT_BODY_LIMIT = 2000
 THREAD_LIMIT = 50
