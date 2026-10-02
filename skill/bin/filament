@@ -48,8 +48,8 @@ LOCK_ALIVE_SECONDS = 120
 # work state is best-effort, so an id answered once is never answered again
 # while it is still recorded here).
 REPLIED_MAX = 1000
-CONTEXT_LIMIT = 40
-CONTEXT_LIMIT_BACKCHANNEL = 100
+CONTEXT_LIMIT = 15
+CONTEXT_LIMIT_BACKCHANNEL = 15
 CONTEXT_KEYS = (
     "event_id", "sender", "body", "ts", "media", "is_from_self",
     "is_from_principal", "is_from_agent", "thread_id",

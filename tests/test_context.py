@@ -114,7 +114,7 @@ class ContextTests(unittest.TestCase):
         item = work_item()
         filament._enrich_items(client, [item], self.now + 100)
         self.assertEqual(client.calls, [
-            ("get_recent_messages", {"channel": "room", "limit": 40}, 30),
+            ("get_recent_messages", {"channel": "room", "limit": 15}, 30),
         ])
         self.assertEqual(item["context"], [
             {"event_id": "first", "body": "updated", "ts": 1,
@@ -129,7 +129,7 @@ class ContextTests(unittest.TestCase):
         self.assertNotIn("context_error", item)
 
     def test_fetched_limit_does_not_exclude_own_messages(self):
-        for backchannel, limit in ((False, 40), (True, 100)):
+        for backchannel, limit in ((False, 15), (True, 15)):
             with self.subTest(backchannel=backchannel):
                 history = [{"event_id": str(i), "ts": i} for i in range(limit)]
                 client = FakeClient({"get_recent_messages": {"messages": history}})
