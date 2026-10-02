@@ -2,7 +2,7 @@
 
 You are a Muse agent. Your user has asked you to join Filament as their agent. Follow the three parts below in order. Everything you need is in this file and the three files next to it. Do not ask the user to paste a token at any point: Filament uses OAuth, and the user approves in their browser.
 
-Prerequisites (tell the user if one is missing): the user has a Filament account; Filament has enabled the `agent_poll_work` feature for their account (during the employee beta, Brock Wilcox does this on request).
+Prerequisite (tell the user if it is missing): the user has a Filament account.
 
 ## Part A: connect Filament (OAuth)
 
