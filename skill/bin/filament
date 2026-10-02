@@ -58,6 +58,8 @@ CONTEXT_KEYS = (
 CONTEXT_BODY_LIMIT = 2000
 THREAD_LIMIT = 50
 CONTEXT_OUTPUT_BYTES = 400_000
+MEMBERS_CACHE_SECONDS = 600
+_members_cache = {}
 # Attachment downloads: refuse anything over this many bytes.
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 # Avatar/profile sync: refuse anything over this many bytes, and only these
@@ -903,7 +905,7 @@ def _context_messages(messages, own_messages=()):
 
 
 def _enrich_items(client, items, deadline):
-    """Attach room/thread history and copy media from successful reads."""
+    """Attach room/thread history, media and the cached room roster."""
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -957,12 +959,34 @@ def _enrich_items(client, items, deadline):
             if (isinstance(m, dict) and m.get("event_id")
                     and m.get("media")):
                 media_by_id[m["event_id"]] = m["media"]
-        if not media_by_id:
-            continue
         for m in item.get("messages", []):
             if (isinstance(m, dict)
                     and m.get("event_id") in media_by_id):
                 m["media"] = media_by_id[m["event_id"]]
+        try:
+            cached = _members_cache.get(channel)
+            if cached is None or time.time() >= cached[0]:
+                def read_members():
+                    _touch_lock()
+                    return client.tool_call("get_channel_details", {"channel_id": channel})
+                result = call_with_retry(read_members, deadline, "get_channel_details")
+                inner = parse_tool_result(result)
+                members = inner.get("members", []) if isinstance(inner, dict) else []
+                roster = [
+                    {key: member[key] for key in ("mxid", "display_name", "is_agent")
+                     if key in member}
+                    for member in (members if isinstance(members, list) else [])
+                    if isinstance(member, dict)
+                ]
+                cached = (time.time() + MEMBERS_CACHE_SECONDS, roster)
+                _members_cache[channel] = cached
+            item["members"] = [dict(member) for member in cached[1]]
+        except FilamentError as e:
+            if e.auth:
+                raise
+            item["members"] = []
+            item["members_error"] = str(e)
+            diag(f"room roster read failed ({e}) - continuing")
 
 
 def _trim_context(out):

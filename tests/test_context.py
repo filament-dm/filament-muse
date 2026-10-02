@@ -70,6 +70,8 @@ def work_item(**overrides):
 
 class ContextTests(unittest.TestCase):
     def setUp(self):
+        filament._members_cache.clear()
+        self.addCleanup(filament._members_cache.clear)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.state_dir = Path(self.temp.name) / "state"
@@ -115,6 +117,7 @@ class ContextTests(unittest.TestCase):
         filament._enrich_items(client, [item], self.now + 100)
         self.assertEqual(client.calls, [
             ("get_recent_messages", {"channel": "room", "limit": 15}, 30),
+            ("get_channel_details", {"channel_id": "room"}, 30),
         ])
         self.assertEqual(item["context"], [
             {"event_id": "first", "body": "updated", "ts": 1,
@@ -280,7 +283,63 @@ class ContextTests(unittest.TestCase):
         with patch.object(filament, "_touch_lock", side_effect=lambda: events.append("touch")), \
                 patch.object(client, "tool_call", side_effect=recorded_call):
             filament._enrich_items(client, [work_item(thread_id="root")], self.now + 100)
-        self.assertEqual(events, ["touch", "get_recent_messages"] * 4 + ["touch", "get_thread"])
+        self.assertEqual(events, ["touch", "get_recent_messages"] * 4 + [
+            "touch", "get_thread", "touch", "get_channel_details",
+        ])
+
+    def test_members_filtered_and_read_with_channel_id(self):
+        member = {"mxid": "@alice:example.org", "display_name": "Alice", "is_agent": False}
+        client = FakeClient({"get_channel_details": {
+            "members": [None, "bad", 7, [], dict(member, extra="discard")],
+        }})
+        item = work_item()
+        filament._enrich_items(client, [item], self.now + 100)
+        self.assertEqual(item["members"], [member])
+        self.assertEqual(client.calls[-1], (
+            "get_channel_details", {"channel_id": "room"}, 30,
+        ))
+
+    def test_members_cache_reused_until_expiry_and_separate_per_channel(self):
+        member = {"mxid": "@alice:example.org", "display_name": "Alice", "is_agent": False}
+        client = FakeClient({"get_channel_details": {"members": [member]}})
+        first, second = work_item(), work_item()
+        filament._enrich_items(client, [first], self.now + 100)
+        self.advance(599)
+        filament._enrich_items(client, [second], self.now + 100)
+        self.assertEqual(second["members"], [member])
+        self.assertEqual(sum(n == "get_channel_details" for n, _, _ in client.calls), 1)
+        filament._enrich_items(client, [work_item(channel_id="other")], self.now + 100)
+        self.assertEqual(sum(n == "get_channel_details" for n, _, _ in client.calls), 2)
+        self.advance(1)
+        client.results["get_channel_details"] = {"members": []}
+        third = work_item()
+        filament._enrich_items(client, [third], self.now + 100)
+        self.assertEqual(third["members"], [])
+        self.assertEqual(sum(n == "get_channel_details" for n, _, _ in client.calls), 3)
+
+    def test_members_failure_preserves_context_thread_and_media(self):
+        client = FakeClient({
+            "get_recent_messages": {"messages": [{"event_id": "history", "ts": 1}]},
+            "get_thread": {"messages": [{"event_id": "own", "media": ["image"]}]},
+            "get_channel_details": filament.FilamentError("roster boom"),
+        })
+        item = work_item(thread_id="root")
+        filament._enrich_items(client, [item], self.now + 100)
+        self.assertEqual([m["event_id"] for m in item["context"]], ["history", "own"])
+        self.assertEqual(item["thread"], [{"event_id": "own", "media": ["image"]}])
+        self.assertEqual(item["messages"][0]["media"], ["image"])
+        self.assertEqual(item["members"], [])
+        self.assertEqual(item["members_error"], "roster boom")
+        self.assertIn("room roster read failed", self.stderr.getvalue())
+        self.assertNotIn("room", filament._members_cache)
+
+    def test_members_auth_failure_propagates_without_retry(self):
+        client = FakeClient({"get_channel_details": filament.FilamentError("denied", auth=True)})
+        with self.assertRaises(filament.FilamentError) as raised:
+            filament._enrich_items(client, [work_item()], self.now + 100)
+        self.assertTrue(raised.exception.auth)
+        self.assertEqual(sum(n == "get_channel_details" for n, _, _ in client.calls), 1)
+        self.sleep.assert_not_called()
 
     def test_both_listener_branches_preserve_work_and_reply_targets(self):
         for budget, poll_wait, enrichment_deadline in ((100, 30, 1100), (10, 0, 1020)):
