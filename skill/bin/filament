@@ -466,7 +466,7 @@ def cmd_media(mxc_url, out_path):
 
 
 def _newest_avatar_webp():
-    """Newest avatar-<digits>-<n>.webp in ~/workspace/avatars, or None.
+    """Newest avatar-<digits>-<n>.webp by numbers in the name, or None.
 
     Only files literally named avatar-<digits>-<n>.webp qualify — every
     other image name in the directory (face crops, headshots, edit
@@ -480,17 +480,18 @@ def _newest_avatar_webp():
     except OSError:
         return None
     for name in names:
-        if not re.fullmatch(r"avatar-\d+-\d+\.webp", name):
+        match = re.fullmatch(r"avatar-(\d+)-(\d+)\.webp", name)
+        if not match:
             continue
         path = os.path.join(AVATAR_DIR, name)
         try:
             if not os.path.isfile(path):
                 continue
-            mtime = os.stat(path).st_mtime
         except OSError:
             continue
-        if best is None or mtime > best[0]:
-            best = (mtime, path)
+        key = (int(match.group(1)), int(match.group(2)), name)
+        if best is None or key > best[0]:
+            best = (key, path)
     return best[1] if best else None
 
 
@@ -515,7 +516,10 @@ def _upload_bytes(body, filename, ctype):
         raise FilamentError(f"avatar upload: HTTP {e.code}")
     except (urllib.error.URLError, OSError) as e:
         raise FilamentError(f"avatar upload: network error: {e}")
-    raw = dc.read_response_body(resp)
+    try:
+        raw = dc.read_response_body(resp)
+    except (OSError, urllib.error.URLError, TimeoutError) as e:
+        raise FilamentError(f"avatar upload: read error: {e}")
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -562,14 +566,15 @@ HEADSHOT_SIZE = 512        # cropped avatars are resized to this square
 def _subject_bbox(img):
     """Bounding box of the non-background subject, or None.
 
-    Uses the alpha channel when the image has one; otherwise treats the
-    most common corner colour as the background and takes every pixel
-    that differs from it by more than a small tolerance.
+    Uses the alpha channel when at least one pixel has alpha <= 16;
+    otherwise treats the most common corner colour as the background
+    and takes every pixel that differs from it by more than a small tolerance.
     """
     if img.mode in ("RGBA", "LA") or (img.mode == "P"
                                       and "transparency" in img.info):
         alpha = img.convert("RGBA").split()[3]
-        return alpha.point(lambda v: 255 if v > 16 else 0).getbbox()
+        if alpha.getextrema()[0] <= 16:
+            return alpha.point(lambda v: 255 if v > 16 else 0).getbbox()
     rgb = img.convert("RGB")
     w, h = rgb.size
     corners = [rgb.getpixel(p)
@@ -623,9 +628,10 @@ def cmd_profile(client, avatar_path, about, crop_spec, no_crop):
 
     Unless --no-crop is given, the image is cropped to a head shot before
     upload: --crop x,y,w,h overrides the box, otherwise the box is found
-    automatically (alpha channel when present, else the non-background
-    region). The crop is resized to 512x512 PNG, uploaded, and a copy is
-    saved to state/media/avatar-preview.png. The box used is printed.
+    automatically (alpha channel when any pixel has alpha <= 16, else
+    the non-background region). The crop is resized to 512x512 PNG,
+    uploaded, and a copy is saved to state/media/avatar-preview.png.
+    The box used is printed.
     set_profile is then called with the mxc url as `image` (plus `about`
     when given). The display name is never touched: the user chose it in
     Filament.
@@ -653,8 +659,11 @@ def cmd_profile(client, avatar_path, about, crop_spec, no_crop):
     preview_path = None
     if no_crop:
         ctype = _check_avatar_source(path)
-        with open(path, "rb") as f:
-            body = f.read()
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError as e:
+            raise FilamentError(f"avatar file unreadable: {e}")
         filename = os.path.basename(path)
         diag("no crop requested; uploading the original file")
     else:
@@ -663,34 +672,46 @@ def cmd_profile(client, avatar_path, about, crop_spec, no_crop):
                 "head-shot cropping needs the Pillow package "
                 "(pip install pillow); use --no-crop to skip cropping")
         _check_avatar_source(path)
-        with Image.open(path) as img:
-            if crop_spec:
-                box = _parse_crop(crop_spec, img.size)
-            else:
-                bbox = _subject_bbox(img)
-                if bbox is None:
-                    raise FilamentError(
-                        "no subject found for the automatic head-shot crop "
-                        "(image is all background): pass --crop x,y,w,h or "
-                        "--no-crop")
-                box = _head_box(bbox, img.size)
-            x, y, w, h = box
-            shot = img.convert("RGB").crop((x, y, x + w, y + h)).resize(
-                (HEADSHOT_SIZE, HEADSHOT_SIZE), Image.LANCZOS)
-        buf = io.BytesIO()
-        shot.save(buf, "PNG")
+        try:
+            with Image.open(path) as img:
+                if crop_spec:
+                    box = _parse_crop(crop_spec, img.size)
+                else:
+                    bbox = _subject_bbox(img)
+                    if bbox is None:
+                        raise FilamentError(
+                            "no subject found for the automatic head-shot crop "
+                            "(image is all background): pass --crop x,y,w,h or "
+                            "--no-crop")
+                    box = _head_box(bbox, img.size)
+                x, y, w, h = box
+                transparent = img.mode in ("RGBA", "LA") or (
+                    img.mode == "P" and "transparency" in img.info)
+                shot = img.convert("RGBA" if transparent else "RGB").crop(
+                    (x, y, x + w, y + h)).resize(
+                        (HEADSHOT_SIZE, HEADSHOT_SIZE), Image.LANCZOS)
+            buf = io.BytesIO()
+            shot.save(buf, "PNG")
+        except (OSError, ValueError) as e:
+            # PIL.UnidentifiedImageError is a subclass of OSError.
+            raise FilamentError(f"avatar image: {e}")
         body = buf.getvalue()
         stem = os.path.splitext(os.path.basename(path))[0]
         filename = stem + "-headshot.png"
         preview_path = os.path.join(STATE_DIR, "media", "avatar-preview.png")
-        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
-        with open(preview_path, "wb") as f:
-            f.write(body)
+        try:
+            os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+            with open(preview_path, "wb") as f:
+                f.write(body)
+        except OSError as e:
+            raise FilamentError(f"avatar preview: {e}")
         crop_box = [x, y, w, h]
         ctype = "image/png"
         diag(f"crop box (x,y,w,h): {x},{y},{w},{h} "
              f"-> preview {preview_path}")
-    mxc = _upload_bytes(body, filename, ctype)
+    # Uniform policy retries all non-auth upload failures, including 4xx, after 2/4/8s.
+    mxc = call_with_retry(lambda: _upload_bytes(body, filename, ctype),
+                          None, "avatar upload")
     arguments = {"image": mxc}
     if about is not None:
         arguments["about"] = about
