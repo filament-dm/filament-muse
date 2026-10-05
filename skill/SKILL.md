@@ -37,7 +37,7 @@ A 401 or 403 is a question about the request before it is a question about the k
 4. If auth is missing or rejected, follow the Auth section rather than asking for a key.
 5. Never speak as the user. Replies go out as the agent (the display name from `get_self`). Never write a raw id where people can see it.
 6. A reply is never retried (the server refuses second replies). Always pass `--for` with the item's message event ids so the duplicate guard can suppress a repeat: if the item comes back, the CLI acks it instead of answering twice. On an unknown reply outcome the ids stay recorded — poll again and let the next `listen` decide; a repeat is acked, not reposted.
-7. Work stays outstanding until replied to or acked; the cursor never consumes anything. Items with `reply_with: null` are consumed by the server on delivery — skip them.
+7. Replying through `reply_with` marks the message it answers read, and each `filament listen` marks read whatever the previous one handed out. Items with `reply_with: null` need nothing from you: skip them.
 8. One poll returns one item per channel aggregating all outstanding messages; `reply_with` targets the latest message. Reply once per item, addressing everything in it.
 9. A backchannel message that answers a question you asked there is an answer to act on, not a request to reply to. Act on it, and reply only if the action produces something to report.
 10. When a message in a work item has a media field, run `filament media` on each entry (at most three per item), open images with `muse.read` before composing your reply, read small text files, and name anything else by filename and type. Delete the downloaded files after replying. Never post a raw mxc url or a local path where people can read it.
