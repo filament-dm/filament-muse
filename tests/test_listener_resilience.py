@@ -237,6 +237,60 @@ class ListenerResilienceTests(unittest.TestCase):
         self.assertFalse((self.state / "auth_blips").exists())
         self.assertFalse((self.state / "frontdoor.wanted").exists())
 
+    def test_request_refused_after_good_probe_pauses(self):
+        client = FakeClient(polls=[self.auth(), self.auth()])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 2)
+        self.assertEqual(sum(n == "poll_work" for n, _, _ in client.calls), 2)
+        self.sleep.assert_called_once_with(15)
+        self.assertTrue((self.state / "auth_failed").exists())
+        self.assertFalse((self.state / "run.lock").exists())
+
+    def test_probe_network_error_waits_for_next_probe(self):
+        client = FakeClient(polls=[self.auth(), {"work": [work_item()]}])
+        original = client.tool_call
+        identities = iter([{}, filament.urllib.error.URLError("down"), {}])
+
+        def request(name, args, timeout=30):
+            if name == "get_self":
+                result = next(identities)
+                if isinstance(result, Exception):
+                    raise result
+            return original(name, args, timeout)
+
+        with patch.object(client, "tool_call", side_effect=request):
+            self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        self.assertEqual(self.sleep.call_args_list, [call(15), call(60)])
+        self.assertFalse((self.state / "auth_failed").exists())
+
+    def test_backstop_yields_during_auth_probe(self):
+        client = FakeClient(polls=[self.auth()])
+
+        def sleep(seconds):
+            self.assertLessEqual(seconds, 2)
+            self.advance(seconds)
+            self.wanted()
+
+        self.sleep.side_effect = sleep
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100",
+                                      "--role", "backstop"), 3)
+        self.assertEqual(json.loads(self.stdout.getvalue()), {"work": []})
+        self.assertFalse(any(n == "get_self" for n, _, _ in client.calls[1:]))
+        self.assertFalse((self.state / "run.lock").exists())
+        self.assertFalse((self.state / "auth_failed").exists())
+
+    def test_stale_lock_claimed_by_another_starter_is_left_alone(self):
+        self.lock()
+        self.advance(filament.LOCK_ALIVE_SECONDS)
+
+        def other_starter_claims(fd, op):
+            # Another starter cleared the stale lock and took it while this
+            # one waited for the guard.
+            self.lock("frontdoor")
+
+        with patch.object(filament.fcntl, "flock", side_effect=other_starter_claims):
+            self.assertEqual(self.run_cli(FakeClient(), "listen", "--budget", "100"), 3)
+        self.assertEqual(filament._lock_info()[0], {"start": "900", "role": "frontdoor"})
+
     def test_handoff_timeout_cleans_wanted_preserves_lock(self):
         self.lock()
         self.assertEqual(self.run_cli(FakeClient(), "listen", "--budget", "100"), 3)

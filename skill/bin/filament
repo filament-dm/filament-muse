@@ -12,6 +12,7 @@ See SKILL.md and references/protocol.md.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -808,7 +809,7 @@ def _remove_state(name):
         pass
 
 
-def _handle_auth(client, error, deadline=None):
+def _handle_auth(client, error, deadline=None, role=None):
     """Recover a listener blip, or raise a handled auth error for exit 2."""
     if error.auth_handled:
         raise error
@@ -825,8 +826,7 @@ def _handle_auth(client, error, deadline=None):
             for delay in (15, 60):
                 if time.time() + delay >= deadline:
                     break
-                _touch_lock()
-                time.sleep(delay)
+                _wait_listening(delay, role)
                 if time.time() >= deadline:
                     break
                 _touch_lock()
@@ -840,13 +840,35 @@ def _handle_auth(client, error, deadline=None):
                     error = probe
                     if probe.code == -32002:
                         break
+                except (urllib.error.URLError, OSError) as probe:
+                    # An unreachable server says nothing about the token.
+                    diag(f"auth probe could not reach the server ({probe})")
                 else:
                     diag("authentication blip recovered - continuing listener")
                     return
     if confirmed:
-        write_state("auth_failed", str(int(time.time())))
+        _confirm_auth(error)
     error.auth_handled = True
     raise error
+
+
+def _confirm_auth(error):
+    """Pause the agent: write the auth_failed marker and raise for exit 2."""
+    write_state("auth_failed", str(int(time.time())))
+    error.auth_handled = True
+    raise error
+
+
+def _wait_listening(delay, role):
+    """Sleep while holding the lock; a backstop still yields to a front door."""
+    end = time.time() + delay
+    while True:
+        _yield_if_wanted(role)
+        _touch_lock()
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(remaining if role != "backstop" else min(2, remaining))
 
 
 class _ListenerYield(Exception):
@@ -874,6 +896,7 @@ class _ListeningClient:
             return value
 
         def request(*args, **kwargs):
+            recovered = False
             while True:
                 if name == "tool_call" and args[0] == "poll_work":
                     _yield_if_wanted(self.role)
@@ -882,7 +905,12 @@ class _ListeningClient:
                 except FilamentError as error:
                     if not error.auth:
                         raise
-                    _handle_auth(self.client, error, self.deadline)
+                    if recovered:
+                        # The token passed get_self yet this request is
+                        # still refused: the rejection is not a blip.
+                        _confirm_auth(error)
+                    _handle_auth(self.client, error, self.deadline, self.role)
+                    recovered = True
         return request
 
 
@@ -925,14 +953,17 @@ def cmd_listen(client, deadline, wait, role="frontdoor"):
                 return 3
             time.sleep(2)
         os.makedirs(STATE_DIR, exist_ok=True)
-        # Exclusive creation prevents simultaneous starters claiming the lock.
-        if content is not None:
-            _remove_state("run.lock")
-        try:
+        # Starters check and claim the lock one at a time, so two of them can
+        # never both clear the same stale lock and each create their own.
+        with open(state_path("run.lock.guard"), "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            content, age = _lock_info()
+            if content is not None and age < LOCK_ALIVE_SECONDS:
+                return 3
+            if content is not None:
+                _remove_state("run.lock")
             with open(lock, "x") as f:
                 json.dump({"start": run_start, "role": role}, f)
-        except FileExistsError:
-            return 3
         owned = True
         if role == "frontdoor":
             _remove_state("frontdoor.wanted")
