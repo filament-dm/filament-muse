@@ -384,15 +384,29 @@ def cmd_hello(client):
     return 0
 
 
+def _ack_only(client, event_ids):
+    """Mark event ids read without being handed new work.
+
+    `max_items: 0` applies only the ack. An ordinary poll could hand over work
+    this call never shows the agent, and the next poll would mark it read. A
+    server that rejects 0 gets the plain ack.
+    """
+    try:
+        return client.tool_call(
+            "poll_work", {"wait_seconds": 0, "ack": event_ids, "max_items": 0})
+    except FilamentError as e:
+        if "-32602" not in str(e):
+            raise
+    return client.tool_call("poll_work", {"wait_seconds": 0, "ack": event_ids})
+
+
 def cmd_ack(client, event_ids):
     # A skipped item is handled like an answered one: if the server's ack does
     # not take, the duplicate guard in listen filters the item when it resurfaces.
     _record_replied(event_ids)
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(
-        lambda: client.tool_call("poll_work",
-                                 {"wait_seconds": 0, "ack": event_ids}),
-        None, "poll_work ack")
+        lambda: _ack_only(client, event_ids), None, "poll_work ack")
     print(json.dumps(parse_tool_result(result), indent=2))
     return 0
 
@@ -762,9 +776,7 @@ def cmd_reply(client, with_json, body, for_ids):
         # so ack it instead of posting a second reply.
         call_with_retry(client.handshake, None, "handshake")
         call_with_retry(
-            lambda: client.tool_call(
-                "poll_work", {"wait_seconds": 0, "ack": event_ids}),
-            None, "poll_work ack")
+            lambda: _ack_only(client, event_ids), None, "poll_work ack")
         diag(f"duplicate reply suppressed; acked {len(event_ids)} id(s)")
         print(json.dumps({"acked": event_ids}))
         return 0
