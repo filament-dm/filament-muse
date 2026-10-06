@@ -109,7 +109,7 @@ def write_state(name, text):
 
 
 def _lock_info():
-    """(content, age_seconds) of state/run.lock, or (None, None) if absent."""
+    """(start/role metadata, age_seconds), or (None, None) if absent."""
     path = state_path("run.lock")
     try:
         st = os.stat(path)
@@ -120,7 +120,15 @@ def _lock_info():
             content = f.read().strip()
     except OSError:
         content = ""
-    return content, time.time() - st.st_mtime
+    try:
+        data = json.loads(content)
+    except ValueError:
+        data = content
+    if not isinstance(data, dict):
+        data = {"start": str(data), "role": "frontdoor"}
+    data["start"] = str(data.get("start", ""))
+    data["role"] = data.get("role", "frontdoor")
+    return data, time.time() - st.st_mtime
 
 
 def _touch_lock():
@@ -163,9 +171,11 @@ def _record_replied(event_ids):
 class FilamentError(Exception):
     """A failed Filament request. auth=True means the token was rejected."""
 
-    def __init__(self, message, auth=False):
+    def __init__(self, message, auth=False, code=None):
         super().__init__(message)
         self.auth = auth
+        self.code = code
+        self.auth_handled = False
 
 
 class Client:
@@ -247,7 +257,7 @@ class Client:
             code = err.get("code") if isinstance(err, dict) else None
             msg = err.get("message") if isinstance(err, dict) else str(err)
             if code in AUTH_ERROR_CODES:
-                raise FilamentError(f"auth error {code}: {msg}", auth=True)
+                raise FilamentError(f"auth error {code}: {msg}", auth=True, code=code)
             raise FilamentError(f"JSON-RPC error {code}: {msg}")
         result = data.get("result")
         if isinstance(result, dict) and result.get("_sessionId"):
@@ -791,44 +801,149 @@ def cmd_reply(client, with_json, body, for_ids):
     return 0
 
 
-def cmd_listen(client, deadline, wait):
-    if os.path.exists(state_path("auth_failed")):
-        diag("auth_failed marker present — no request attempted")
-        return 2
+def _remove_state(name):
+    try:
+        os.remove(state_path(name))
+    except OSError:
+        pass
 
+
+def _handle_auth(client, error, deadline=None):
+    """Recover a listener blip, or raise a handled auth error for exit 2."""
+    if error.auth_handled:
+        raise error
+    confirmed = error.code == -32002
+    if not confirmed:
+        try:
+            with open(state_path("auth_blips")) as f:
+                blips = f.read().splitlines()
+        except OSError:
+            blips = []
+        write_state("auth_blips", "\n".join(
+            (blips + [str(int(time.time()))])[-20:]) + "\n")
+        if deadline is not None:
+            for delay in (15, 60):
+                if time.time() + delay >= deadline:
+                    break
+                _touch_lock()
+                time.sleep(delay)
+                if time.time() >= deadline:
+                    break
+                _touch_lock()
+                try:
+                    client.tool_call("get_self", {},
+                                     timeout=min(30, deadline - time.time()))
+                except FilamentError as probe:
+                    if not probe.auth:
+                        raise
+                    confirmed = True
+                    error = probe
+                    if probe.code == -32002:
+                        break
+                else:
+                    diag("authentication blip recovered - continuing listener")
+                    return
+    if confirmed:
+        write_state("auth_failed", str(int(time.time())))
+    error.auth_handled = True
+    raise error
+
+
+class _ListenerYield(Exception):
+    pass
+
+
+def _yield_if_wanted(role):
+    if role == "backstop":
+        try:
+            age = time.time() - os.stat(state_path("frontdoor.wanted")).st_mtime
+        except OSError:
+            return
+        if age < 120:
+            raise _ListenerYield()
+
+
+class _ListeningClient:
+    """Retry the interrupted operation without losing loop or enrichment state."""
+    def __init__(self, client, deadline, role):
+        self.client, self.deadline, self.role = client, deadline, role
+
+    def __getattr__(self, name):
+        value = getattr(self.client, name)
+        if name not in ("handshake", "heartbeat", "tool_call"):
+            return value
+
+        def request(*args, **kwargs):
+            while True:
+                if name == "tool_call" and args[0] == "poll_work":
+                    _yield_if_wanted(self.role)
+                try:
+                    return value(*args, **kwargs)
+                except FilamentError as error:
+                    if not error.auth:
+                        raise
+                    _handle_auth(self.client, error, self.deadline)
+        return request
+
+
+def cmd_listen(client, deadline, wait, role="frontdoor"):
+    lock = state_path("run.lock")
+    owned = False
+    old_term = None
     run_start = os.environ.get("FILAMENT_RUN_START")
     try:
-        run_start = str(int(run_start)) if run_start else str(int(time.time()))
+        run_start = int(run_start) if run_start else int(time.time())
     except ValueError:
-        run_start = str(int(time.time()))
-    lock = state_path("run.lock")
-    content, age = _lock_info()
-    if (content is not None and age < LOCK_ALIVE_SECONDS
-            and content != run_start):
-        diag(f"another run is listening (run.lock age {int(age)}s) — exiting")
-        return 3
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(lock, "w") as f:
-        f.write(run_start)
+        run_start = int(time.time())
+    lock_data = {"start": str(run_start), "role": role}
 
-    def release_lock():
-        try:
-            with open(lock) as f:
-                if f.read().strip() == run_start:
-                    os.remove(lock)
-        except OSError:
-            pass
+    def cleanup():
+        if owned and _lock_info()[0] == lock_data:
+            _remove_state("run.lock")
+        _remove_state("frontdoor.wanted")
 
     def on_term(signum, frame):
-        release_lock()
+        cleanup()
         os._exit(3)
 
-    old_term = signal.signal(signal.SIGTERM, on_term)
     try:
-        return _listen_loop(client, deadline, wait)
+        old_term = signal.signal(signal.SIGTERM, on_term)
+        if os.path.exists(state_path("auth_failed")):
+            diag("auth_failed marker present - no request attempted")
+            return 2
+        _yield_if_wanted(role)
+        handoff_end = min(deadline, time.time() + 60)
+        while True:
+            content, age = _lock_info()
+            if content is None or age >= LOCK_ALIVE_SECONDS:
+                break
+            if role != "frontdoor" or content["role"] != "backstop":
+                diag("another run is listening - exiting")
+                return 3
+            write_state("frontdoor.wanted", str(run_start))
+            if time.time() + 2 > handoff_end:
+                return 3
+            time.sleep(2)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        # Exclusive creation prevents simultaneous starters claiming the lock.
+        if content is not None:
+            _remove_state("run.lock")
+        try:
+            with open(lock, "x") as f:
+                json.dump({"start": run_start, "role": role}, f)
+        except FileExistsError:
+            return 3
+        owned = True
+        if role == "frontdoor":
+            _remove_state("frontdoor.wanted")
+        return _listen_loop(_ListeningClient(client, deadline, role), deadline, wait)
+    except _ListenerYield:
+        print(json.dumps({"work": []}))
+        return 3
     finally:
-        release_lock()
-        signal.signal(signal.SIGTERM, old_term)
+        cleanup()
+        if old_term is not None:
+            signal.signal(signal.SIGTERM, old_term)
 
 
 def _poll(client, cursor, skip_ids, poll_wait, deadline):
@@ -1038,6 +1153,8 @@ def _listen_loop(client, deadline, wait):
             try:
                 inner = _poll(client, cursor, skip_ids, 0, None)
             except FilamentError as e:
+                if e.auth:
+                    raise
                 diag(f"final poll failed ({e})")
                 print(json.dumps({"work": []}))
                 return 3
@@ -1092,7 +1209,7 @@ def cmd_ensure():
         return 0
     content, age = _lock_info()
     if content is not None and age < LOCK_ALIVE_SECONDS:
-        print(json.dumps({"listener": "alive"}))
+        print(json.dumps({"listener": "alive", "role": content["role"]}))
         return 0
     print(json.dumps({"listener": "none"}))
     return 0
@@ -1114,6 +1231,8 @@ def build_parser():
                     help="sugar for --deadline now+hours*3600 (front door)")
     pl.add_argument("--wait", type=float, default=30,
                     help="seconds per poll_work call (server max 60)")
+
+    pl.add_argument("--role", choices=("frontdoor", "backstop"), default="frontdoor")
 
     pr = sub.add_parser("reply", help="make the reply_with tool call once")
     pr.add_argument("--with", dest="with_json", required=True,
@@ -1167,7 +1286,8 @@ def main(argv=None):
     os.makedirs(STATE_DIR, exist_ok=True)
 
     if args.cmd == "reset":
-        for name in ("auth_failed", "alerted", "failures", "run.lock"):
+        for name in ("auth_failed", "alerted", "failures", "run.lock",
+                     "frontdoor.wanted", "auth_blips"):
             try:
                 os.remove(state_path(name))
             except OSError:
@@ -1188,7 +1308,7 @@ def main(argv=None):
                     ap.error("listen needs --deadline, --budget or --hours")
                 else:
                     deadline = time.time() + args.budget
-            return cmd_listen(client, deadline, args.wait)
+            return cmd_listen(client, deadline, args.wait, args.role)
         if args.cmd == "self":
             return cmd_self(client)
         if args.cmd == "call":
@@ -1206,7 +1326,10 @@ def main(argv=None):
             return cmd_reply(client, args.with_json, args.body, args.for_ids)
     except FilamentError as e:
         if e.auth:
-            write_state("auth_failed", str(int(time.time())))
+            try:
+                _handle_auth(client, e)
+            except FilamentError:
+                pass
             who = getattr(client, "agent_name", None) or "the agent"
             diag(f"authentication failed for {who}: {e}")
             return 2
