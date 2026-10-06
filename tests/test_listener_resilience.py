@@ -291,6 +291,41 @@ class ListenerResilienceTests(unittest.TestCase):
             self.assertEqual(self.run_cli(FakeClient(), "listen", "--budget", "100"), 3)
         self.assertEqual(filament._lock_info()[0], {"start": "900", "role": "frontdoor"})
 
+    def test_failed_turn_gets_its_work_back_next_run(self):
+        client = FakeClient(polls=[{"work": [], "cursor": "c:1"},
+                                   {"work": [work_item()], "cursor": "c:2"}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        self.assertEqual((self.state / "cursor").read_text(), "c:1")
+
+        # The turn never replied; the next run resumes from before the delivery.
+        client = FakeClient(polls=[{"work": [work_item()], "cursor": "c:2"}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        polls = [args for name, args, _ in client.calls if name == "poll_work"]
+        self.assertEqual(polls[0]["cursor"], "c:1")
+        self.assertEqual((self.state / "cursor").read_text(), "c:1")
+
+    def test_cursor_advances_past_empty_polls(self):
+        (self.state / "cursor").write_text("c:5")
+        client = FakeClient(polls=[{"work": [], "cursor": "c:6"},
+                                   {"work": [work_item()], "cursor": "c:7"}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        polls = [args for name, args, _ in client.calls if name == "poll_work"]
+        self.assertEqual([p["cursor"] for p in polls], ["c:5", "c:6"])
+        self.assertEqual((self.state / "cursor").read_text(), "c:6")
+
+    def test_first_run_polls_without_cursor(self):
+        client = FakeClient(polls=[{"work": [work_item()], "cursor": "c:2"}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        polls = [args for name, args, _ in client.calls if name == "poll_work"]
+        self.assertNotIn("cursor", polls[0])
+        self.assertFalse((self.state / "cursor").exists())
+
+    def test_call_drops_null_arguments(self):
+        client = FakeClient()
+        self.assertEqual(self.run_cli(client, "call", "get_recent_messages",
+                                      '{"channel": "room", "cursor": null}'), 0)
+        self.assertEqual(client.calls[0][:2], ("get_recent_messages", {"channel": "room"}))
+
     def test_handoff_timeout_cleans_wanted_preserves_lock(self):
         self.lock()
         self.assertEqual(self.run_cli(FakeClient(), "listen", "--budget", "100"), 3)

@@ -376,6 +376,9 @@ def cmd_call(client, tool, args_json):
         arguments = json.loads(args_json)
     except json.JSONDecodeError as e:
         raise FilamentError(f"bad args JSON: {e}")
+    if isinstance(arguments, dict):
+        # A null argument means "not given"; the server rejects an explicit null.
+        arguments = {k: v for k, v in arguments.items() if v is not None}
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(lambda: client.tool_call(tool, arguments),
                              None, f"tools/call {tool}")
@@ -989,6 +992,20 @@ def cmd_listen(client, deadline, wait, role="frontdoor"):
             signal.signal(signal.SIGTERM, old_term)
 
 
+def _load_cursor():
+    """The poll_work cursor to resume from, or None before the first one."""
+    try:
+        with open(state_path("cursor")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _save_cursor(cursor):
+    if cursor:
+        write_state("cursor", cursor)
+
+
 def _poll(client, cursor, skip_ids, poll_wait, deadline):
     arguments = {"wait_seconds": poll_wait, "max_items": 10}
     if cursor is not None:
@@ -1183,7 +1200,11 @@ def _listen_loop(client, deadline, wait):
             raise
         diag(f"heartbeat failed ({e}) — continuing to poll anyway")
 
-    cursor = None
+    # state/cursor only ever moves past polls that handed out no fresh work.
+    # A poll acknowledges everything up to the cursor it passes, so a run
+    # that resumes from it gets back any work whose turn never answered it;
+    # answered and acked items are read by then and stay away.
+    cursor = _load_cursor()
     skip_ids = set()
     while True:
         # A live listener's lock never looks stale: polls are at most 60 s
@@ -1209,6 +1230,7 @@ def _listen_loop(client, deadline, wait):
                 _trim_context(out)
                 print(json.dumps(out))
                 return 0
+            _save_cursor(inner.get("cursor"))
             print(json.dumps({"work": []}))
             return 3
         poll_wait = min(wait, remaining - 10, 60)
@@ -1217,7 +1239,6 @@ def _listen_loop(client, deadline, wait):
         if poll_wait < 1:
             poll_wait = 1
         inner = _poll(client, cursor, skip_ids, poll_wait, deadline)
-        cursor = inner.get("cursor", cursor)
         fresh, answered = _split_work(inner.get("work") or [])
         skip_ids.update(answered)
         if fresh:
@@ -1227,6 +1248,8 @@ def _listen_loop(client, deadline, wait):
             _trim_context(out)
             print(json.dumps(out))
             return 0
+        cursor = inner.get("cursor", cursor)
+        _save_cursor(cursor)
         if inner.get("truncated"):
             continue
         if answered and not fresh:
