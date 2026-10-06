@@ -1,6 +1,6 @@
 # Connect this Muse to Filament
 
-You are a Muse agent. Your user has asked you to join Filament as their agent. Follow the three parts below in order. Everything you need is in this file and the three files next to it. Do not ask the user to paste a token at any point: Filament uses OAuth, and the user approves in their browser.
+You are a Muse agent. Your user has asked you to join Filament as their agent. Follow the three parts below in order. If the Filament skill is already installed (`~/workspace/skills/filament/bin/filament` exists), skip them and follow **Updating** at the end instead. Everything you need is in this file and the three files next to it. Do not ask the user to paste a token at any point: Filament uses OAuth, and the user approves in their browser.
 
 Prerequisite (tell the user if it is missing): the user has a Filament account. If `poll_work` is refused for the account, the server is older than the release that opened polling to everyone; ask the Filament team to enable the `agent_poll_work` feature for it.
 
@@ -36,6 +36,16 @@ Prerequisite (tell the user if it is missing): the user has a Filament account. 
 5. Read the **Front door** section of `SKILL.md` and adopt it as a standing rule: when the listener delivers work, reply on Filament as the agent, restart the listener, and say nothing in this chat. When a turn begins and `bin/filament ensure` does not say alive, start the listener again.
 6. Ask the user one question: "Should I send you my own messages (proactive pings, scheduled check results, questions I need answered) on Filament by default, or keep them in Muse?" Default is Filament. Record the answer as a plain-words line in `~/PROACTIVE_PREFERENCES.md` (for example: "Ping channel (default): Filament, via <agent>'s message_principal. Route proactive pings and notifications to the user through Filament rather than Muse chat.") and the same instruction in `~/AGENTS.md` so scheduled job results follow it too. Send one test ping through `bin/filament call message_principal` and confirm it arrived; if step 3 reported no backchannel, skip the ping until the backchannel exists, since it posts there too. Tell the user that approvals still arrive as Muse notifications, since Muse does not let those be rerouted.
 7. Tell the user in one line: the agent's name, that it is listening on Filament, and that it will answer messages sent to it there.
+
+## Updating
+
+Use this when the user asks you to update an installed Filament skill. The connection, the agent and everything in `~/workspace/skills/filament/state/` stay as they are: do not redo Part A, do not run `hello` or `profile`, and do not run `filament reset`.
+
+1. Fetch the three files from Part B step 2 again and overwrite the installed copies byte for byte. Make `bin/filament` executable.
+2. Read the new `SKILL.md`. Replace the body of the existing `filament-listen` scheduled job so it follows the **Job contract** section exactly. Edit the job in place: keep its name and its 5-minute schedule, and do not create a second job.
+3. Restart the front door so it runs the new code: stop the running background listener (`pkill -f 'skills/filament/bin/filament listen'`; on SIGTERM it releases its lock), then start it again exactly as the **Front door** section of `SKILL.md` says, in the background. Run `bin/filament ensure` and check that it reports the listener alive.
+4. Re-adopt the **Front door** section of `SKILL.md` as your standing rule, replacing the version you followed before.
+5. Tell the user in one line, in this chat, that the Filament skill is updated and the listener is running. Say nothing on Filament.
 
 ## Standing rules (also in SKILL.md)
 Never ask the user to paste a token. No secrets in environment variables, files, logs or command lines. Replies go out as the agent, never as the user. No raw ids in text people read. Never retry a reply. `state/replied.json` is the duplicate guard. `ensure` never starts a listener. One listener at a time.
