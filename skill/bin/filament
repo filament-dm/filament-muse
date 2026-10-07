@@ -47,6 +47,8 @@ CLIENT_INFO = {"name": "filament-skill", "version": "1.0"}
 AUTH_ERROR_CODES = {-32001, -32002}
 # A lock whose mtime is younger than this is a live listener.
 LOCK_ALIVE_SECONDS = 120
+# A delivered message still unhandled after this long is given up on.
+PENDING_DELIVERY_SECONDS = 3600
 # Duplicate-reply guard: last N replied event ids (no expiry; the server's
 # work state is best-effort, so an id answered once is never answered again
 # while it is still recorded here).
@@ -420,11 +422,14 @@ def _ack_only(client, event_ids):
 def cmd_ack(client, event_ids):
     # A skipped item is handled like an answered one: if the server's ack does
     # not take, the duplicate guard in listen filters the item when it resurfaces.
+    # The ids leave the pending delivery before the network call: once the
+    # cursor moves past them the next poll acknowledges them, so an ack that
+    # never lands cannot hold the cursor back.
     _record_replied(event_ids)
+    _handle_delivery_ids(event_ids)
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(
         lambda: _ack_only(client, event_ids), None, "poll_work ack")
-    _handle_delivery_ids(event_ids)
     print(json.dumps(parse_tool_result(result), indent=2))
     return 0
 
@@ -792,10 +797,10 @@ def cmd_reply(client, with_json, body, for_ids):
     if event_ids and all(e in _load_replied() for e in event_ids):
         # Duplicate guard: every id in this item was already replied to,
         # so ack it instead of posting a second reply.
+        _handle_delivery_ids(event_ids)
         call_with_retry(client.handshake, None, "handshake")
         call_with_retry(
             lambda: _ack_only(client, event_ids), None, "poll_work ack")
-        _handle_delivery_ids(event_ids)
         diag(f"duplicate reply suppressed; acked {len(event_ids)} id(s)")
         print(json.dumps({"acked": event_ids}))
         return 0
@@ -1035,12 +1040,34 @@ def _state_guard():
 
 
 def _load_delivery_locked():
-    """Caller holds run.lock.guard for the entire state transition."""
+    """Caller holds run.lock.guard for the entire state transition.
+
+    A pending delivery older than PENDING_DELIVERY_SECONDS is given up: its
+    cursor becomes state/cursor so one item that never comes back cannot hold
+    the cursor forever. An unreadable file is dropped the same way.
+    """
     try:
         with open(state_path("last_delivery.json")) as f:
-            return json.load(f)
+            delivery = json.load(f)
     except FileNotFoundError:
         return None
+    except (OSError, ValueError) as e:
+        diag(f"last_delivery.json unreadable ({e}) - dropping it")
+        _remove_state("last_delivery.json")
+        return None
+    if (not isinstance(delivery, dict) or not isinstance(delivery.get("ids"), list)
+            or not isinstance(delivery.get("cursor"), (str, type(None)))):
+        diag("last_delivery.json malformed - dropping it")
+        _remove_state("last_delivery.json")
+        return None
+    since = delivery.get("since")
+    if isinstance(since, (int, float)) and time.time() - since > PENDING_DELIVERY_SECONDS:
+        diag(f"giving up on {len(delivery['ids'])} unhandled id(s) after "
+             f"{PENDING_DELIVERY_SECONDS} s")
+        _save_cursor(delivery["cursor"])
+        _remove_state("last_delivery.json")
+        return None
+    return delivery
 
 
 def _save_delivery_locked(delivery):
@@ -1107,7 +1134,10 @@ def _prepare_delivery(out):
         pending = list(dict.fromkeys((previous["ids"] if previous else []) + ids))
         pending = [eid for eid in pending if eid not in consumed]
         if pending:
-            _save_delivery_locked({"cursor": out.get("cursor"), "ids": pending})
+            since = previous.get("since") if previous else None
+            _save_delivery_locked({"cursor": out.get("cursor"), "ids": pending,
+                                   "since": since if since is not None
+                                   else int(time.time())})
         else:
             _save_cursor(out.get("cursor"))
             _remove_state("last_delivery.json")
@@ -1355,8 +1385,11 @@ def _listen_loop(client, deadline, wait):
             _prepare_delivery(out)
             print(json.dumps(out))
             return 0
+        polled_with = cursor
         cursor = _save_poll_cursor(inner.get("cursor", cursor))
-        if inner.get("truncated"):
+        # While a delivery is pending the cursor is held back, so the same
+        # page would come back at once; page on only when the cursor moved.
+        if inner.get("truncated") and cursor != polled_with:
             continue
         if answered and not fresh:
             # 5-second floor: only already-answered items came back, so the

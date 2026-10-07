@@ -1,5 +1,6 @@
 import contextlib
 import io
+import itertools
 import json
 from pathlib import Path
 import tempfile
@@ -27,7 +28,9 @@ class CursorAdvanceTests(unittest.TestCase):
         filament._save_cursor('before')
 
     def pending(self):
-        return json.loads((self.state / 'last_delivery.json').read_text())
+        delivery = json.loads((self.state / 'last_delivery.json').read_text())
+        delivery.pop('since', None)
+        return delivery
 
     def deliver(self, budget=100):
         items = [work_item(messages=[{'event_id': 'greeting'}, {'event_id': 'question'}]),
@@ -195,8 +198,14 @@ class CursorAdvanceTests(unittest.TestCase):
                         polls.append({'work': [], 'cursor': 'also-unsafe'})
                     client = FakeClient(polls=polls)
                     times = [1000, 1095] if budget == 100 else [1000, 1000]
-                    with patch.object(filament.time, 'time', side_effect=times):
+                    clock = itertools.chain(times, itertools.repeat(times[-1]))
+                    with patch.object(filament.time, 'time', side_effect=lambda: next(clock)), \
+                            patch.object(filament.time, 'sleep') as sleep:
                         self.assertEqual(filament._listen_loop(client, 1000 + budget, 30), 3)
+                    if budget == 100:
+                        # The held-back cursor would return the same page, so
+                        # a truncated result waits instead of re-polling at once.
+                        sleep.assert_called()
                     self.assertEqual(filament._load_cursor(), 'before')
                     self.assertEqual(self.pending(), original)
                     self.assertTrue(all(args['cursor'] == 'before'
@@ -219,6 +228,46 @@ class CursorAdvanceTests(unittest.TestCase):
                     self.assertNotIn('already_answered', by_id['new'])
                 self.assertTrue(delivered['context'][0]['already_answered'])
                 self.assertEqual(self.pending()['ids'], ['old', 'new'])
+
+    def test_failed_ack_still_releases_the_cursor(self):
+        self.deliver()
+        down = filament.FilamentError('poll_work ack: network error')
+        with patch.object(filament.time, 'sleep'), self.assertRaises(filament.FilamentError):
+            filament.cmd_ack(FakeClient(polls=[down] * 4), ['greeting', 'question', 'other'])
+        self.assertEqual(filament._load_cursor(), 'delivered')
+        self.assertFalse((self.state / 'last_delivery.json').exists())
+
+    def test_failed_duplicate_guard_ack_still_releases_the_cursor(self):
+        self.deliver()
+        filament._record_replied(['greeting', 'question', 'other'])
+        down = filament.FilamentError('poll_work ack: network error')
+        with patch.object(filament.time, 'sleep'), self.assertRaises(filament.FilamentError):
+            self.reply('greeting,question,other', FakeClient(polls=[down] * 4))
+        self.assertEqual(filament._load_cursor(), 'delivered')
+
+    def test_stale_pending_delivery_is_given_up(self):
+        self.deliver()
+        self.assertEqual(json.loads((self.state / 'last_delivery.json').read_text())['since'], 1000)
+        with patch.object(filament.time, 'time',
+                          return_value=1000 + filament.PENDING_DELIVERY_SECONDS + 1):
+            filament._save_poll_cursor('later')
+        self.assertEqual(filament._load_cursor(), 'later')
+        self.assertFalse((self.state / 'last_delivery.json').exists())
+
+    def test_second_delivery_keeps_the_oldest_since(self):
+        self.deliver()
+        with patch.object(filament.time, 'time', return_value=2000):
+            filament._prepare_delivery({'work': [work_item(messages=[{'event_id': 'new'}])],
+                                        'cursor': 'newest'})
+        self.assertEqual(json.loads((self.state / 'last_delivery.json').read_text())['since'], 1000)
+
+    def test_damaged_delivery_file_is_dropped(self):
+        for text in ('', '{"cursor": "x"}', '[1, 2]'):
+            with self.subTest(text=text):
+                (self.state / 'last_delivery.json').write_text(text)
+                filament._save_poll_cursor('fresh')
+                self.assertEqual(filament._load_cursor(), 'fresh')
+                self.assertFalse((self.state / 'last_delivery.json').exists())
 
     def test_reset_removes_delivery(self):
         self.deliver()
