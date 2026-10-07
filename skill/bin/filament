@@ -825,7 +825,7 @@ def cmd_reply(client, with_json, body, for_ids):
     try:
         result = client.tool_call(tool, arguments, timeout=30)
     except FilamentError as e:
-        if e.rejected:
+        if e.rejected or e.auth:
             with _state_guard():
                 mapping = _load_replied()
                 for event_id in newly_recorded_ids:

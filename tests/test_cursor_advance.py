@@ -140,6 +140,23 @@ class CursorAdvanceTests(unittest.TestCase):
         self.assertTrue({'greeting', 'question'}.isdisjoint(filament._load_replied()))
         self.assertEqual((self.state / 'last_delivery.json').read_bytes(), original)
 
+    def test_reply_auth_error_rolls_back_only_new_ids(self):
+        self.deliver()
+        filament._record_replied(['greeting'])
+        original = (self.state / 'last_delivery.json').read_bytes()
+        client = FakeClient({'post_message': filament.FilamentError('Unauthorized', auth=True)})
+        reply_with = work_item()['reply_with']
+        reply_with['args']['in_reply_to'] = 'question'
+        with patch.object(filament, 'Client', return_value=client):
+            self.assertEqual(filament.main([
+                'reply', '--with', json.dumps(reply_with), '--body', 'Answer',
+                '--for', 'greeting,question']), 2)
+        self.assertIn('greeting', filament._load_replied())
+        self.assertNotIn('question', filament._load_replied())
+        self.assertEqual((self.state / 'last_delivery.json').read_bytes(), original)
+        self.assertEqual(filament._load_cursor(), 'before')
+        self.assertFalse((self.state / 'auth_failed').exists())
+
     def test_unknown_reply_outcome_keeps_duplicate_protection(self):
         self.deliver()
         with self.assertRaises(filament.FilamentError):
