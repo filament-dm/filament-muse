@@ -70,6 +70,184 @@ class ListenerResilienceTests(unittest.TestCase):
         path.touch()
         os.utime(path, (self.now - age, self.now - age))
 
+    def handling_lock(self, age=0, role="backstop", pending_ids=None):
+        filament.write_state("run.lock", json.dumps({
+            "start": 900, "role": role, "handling": self.now - age}))
+        os.utime(self.state / "run.lock", (self.now - age, self.now - age))
+        filament.write_state("last_delivery.json", json.dumps({
+            "cursor": "before-delivery", "ids": pending_ids or ["event"],
+            "since": self.now - age}))
+
+    def handling_of(self, role="frontdoor"):
+        return {"start": 1000, "role": role, "handling": self.now}
+
+    def test_handling_blocks_backstop_and_ensure_reports_it(self):
+        self.handling_lock(age=239)
+        client = FakeClient()
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100",
+                                      "--role", "backstop"), 3)
+        self.assertEqual(client.calls, [])
+        self.assertIn("handling", self.stderr.getvalue())
+        self.assertEqual(self.run_cli(FakeClient(), "ensure"), 0)
+        self.assertEqual(json.loads(self.stdout.getvalue()),
+                         {"listener": "handling", "role": "backstop"})
+        self.sleep.assert_not_called()
+
+    def test_frontdoor_immediately_claims_its_own_handling_and_saved_cursor(self):
+        self.handling_lock(role="frontdoor")
+        filament.write_state("cursor", "before-delivery")
+        client = FakeClient(polls=[{"work": [work_item()], "cursor": "after"}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100",
+                                      "--role", "frontdoor"), 0)
+        polls = [args for name, args, _ in client.calls if name == "poll_work"]
+        self.assertEqual(polls[0]["cursor"], "before-delivery")
+        self.assertEqual((self.state / "cursor").read_text(), "before-delivery")
+        self.assertEqual(json.loads((self.state / "run.lock").read_text()),
+                         self.handling_of())
+        self.sleep.assert_not_called()
+
+    def test_stale_handling_is_claimable(self):
+        self.handling_lock(age=filament.HANDLING_SECONDS)
+        self.assertEqual(self.run_cli(FakeClient(), "ensure"), 0)
+        self.assertEqual(json.loads(self.stdout.getvalue()), {"listener": "none"})
+        client = FakeClient(polls=[{"work": [work_item()]}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        self.assertEqual(json.loads((self.state / "run.lock").read_text()),
+                         self.handling_of())
+
+    def test_delivery_with_nothing_to_answer_releases_the_lock(self):
+        client = FakeClient(polls=[{"work": [work_item(reply_with=None)]}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        self.assertFalse((self.state / "run.lock").exists())
+
+    def test_successful_reply_ack_and_reset_clear_handling(self):
+        for args in (("ack", "event"),
+                     ("reply", "--with", '{"tool":"post_message"}',
+                      "--body", "hello", "--for", "reply-event"),
+                     ("reply", "--with", '{"tool":"post_message"}',
+                      "--body", "hello", "--for", "reply-event"),
+                     ("reset",)):
+            with self.subTest(args=args):
+                self.handling_lock(pending_ids=["reply-event"] if args[0] == "reply" else ["event"])
+                self.assertEqual(self.run_cli(FakeClient(polls=[{"acknowledged": 1}]), *args), 0)
+                self.assertFalse((self.state / "run.lock").exists())
+
+    def test_frontdoor_waits_for_backstop_handling_expiry(self):
+        self.handling_lock()
+        client = FakeClient(polls=[{"work": [work_item()]}])
+        def wait(seconds):
+            self.assertTrue((self.state / "frontdoor.wanted").exists())
+            self.assertEqual(client.calls, [])
+            self.advance(seconds)
+        self.sleep.side_effect = wait
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "300"), 0)
+        self.assertEqual(self.now, 1240)
+        self.assertFalse((self.state / "frontdoor.wanted").exists())
+        self.assertEqual(filament._lock_info()[0]["role"], "frontdoor")
+
+    def test_backstop_never_claims_fresh_handling_of_either_role(self):
+        for role in ("frontdoor", "backstop"):
+            self.handling_lock(role=role)
+            client = FakeClient()
+            self.assertEqual(self.run_cli(client, "listen", "--budget", "300",
+                                          "--role", "backstop"), 3)
+            self.assertEqual(client.calls, [])
+
+    def test_reply_refreshes_handling_and_the_last_ack_releases_it(self):
+        client = FakeClient(polls=[{"work": [work_item(), work_item(
+            messages=[{"event_id": "second", "body": "Another?"}])]}])
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        self.advance(200)
+        self.assertEqual(self.run_cli(FakeClient(), "reply", "--with",
+                                      '{"tool":"post_message"}', "--body", "hello",
+                                      "--for", "own"), 0)
+        self.assertEqual(json.loads((self.state / "last_delivery.json").read_text())["ids"],
+                         ["second"])
+        content, age = filament._lock_info()
+        self.assertEqual(content["start"], "1000")
+        self.assertEqual(age, 0)
+        self.advance(100)
+        self.assertTrue(filament._lock_active(*filament._lock_info()))
+        self.assertEqual(self.run_cli(FakeClient(polls=[{"acknowledged": 1}]),
+                                      "ack", "second"), 0)
+        self.assertFalse((self.state / "run.lock").exists())
+
+    def test_mismatched_reply_ack_and_missing_ids_leave_handling_untouched(self):
+        self.handling_lock(pending_ids=["successor"])
+        path = self.state / "run.lock"
+        before, mtime = path.read_bytes(), path.stat().st_mtime
+        self.advance(10)
+        for args in (("ack", "old"),
+                     ("reply", "--with", '{"tool":"post_message"}',
+                      "--body", "hello", "--for", "old"),
+                     ("reply", "--with", '{"tool":"post_message"}',
+                      "--body", "hello")):
+            self.assertEqual(self.run_cli(FakeClient(polls=[{"acknowledged": 1}]), *args), 0)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(path.stat().st_mtime, mtime)
+
+    def test_refreshed_backstop_handling_wait_is_bounded(self):
+        self.handling_lock()
+        def refresh(seconds):
+            self.advance(seconds)
+            os.utime(self.state / "run.lock", (self.now, self.now))
+        self.sleep.side_effect = refresh
+        client = FakeClient()
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "300"), 3)
+        self.assertEqual(self.now, 1240)
+        self.assertEqual(client.calls, [])
+        self.assertTrue((self.state / "run.lock").exists())
+        self.assertFalse((self.state / "frontdoor.wanted").exists())
+
+    def test_lock_and_wanted_mutations_hold_flock(self):
+        self.lock()
+        def guarded(operation):
+            def checked(path, *args, **kwargs):
+                if Path(path).name in ("run.lock", "frontdoor.wanted"):
+                    with open(self.state / "run.lock.guard", "a") as contender:
+                        with self.assertRaises(BlockingIOError):
+                            filament.fcntl.flock(contender, filament.fcntl.LOCK_EX |
+                                                 filament.fcntl.LOCK_NB)
+                return operation(path, *args, **kwargs)
+            return checked
+        with patch.object(filament, "write_state", guarded(filament.write_state)), \
+                patch.object(filament.os, "remove", guarded(filament.os.remove)), \
+                patch.object(filament.os, "utime", guarded(filament.os.utime)):
+            self.assertEqual(self.run_cli(FakeClient(), "listen", "--budget", "100"), 3)
+            self.assertEqual(self.run_cli(FakeClient(), "reset"), 0)
+            client = FakeClient(polls=[{"work": [work_item()]}])
+            self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+            self.assertEqual(self.run_cli(FakeClient(polls=[{"acknowledged": 1}]),
+                                          "ack", "own"), 0)
+            self.assertEqual(self.run_cli(FakeClient(polls=[{"work": []}]),
+                                          "listen", "--budget", "1"), 3)
+
+    def test_reply_and_ack_preserve_live_listener(self):
+        for args in (("ack", "event"),
+                     ("reply", "--with", '{"tool":"post_message"}',
+                      "--body", "hello", "--for", "reply-event")):
+            with self.subTest(args=args):
+                self.lock("frontdoor")
+                before = (self.state / "run.lock").read_text()
+                self.assertEqual(self.run_cli(FakeClient(polls=[{"acknowledged": 1}]), *args), 0)
+                self.assertEqual((self.state / "run.lock").read_text(), before)
+
+    def test_reply_that_never_reached_the_server_preserves_handling(self):
+        self.handling_lock(pending_ids=["reply-event"])
+        with patch.object(FakeClient, "handshake", side_effect=self.auth()):
+            self.assertEqual(self.run_cli(FakeClient(), "reply", "--with",
+                                          '{"tool":"post_message"}', "--body", "hello",
+                                          "--for", "reply-event"), 2)
+        self.assertIn("handling", json.loads((self.state / "run.lock").read_text()))
+
+    def test_bystander_preserves_another_frontdoors_wanted(self):
+        self.lock("frontdoor")
+        filament.write_state("frontdoor.wanted", "999")
+        for role in ("frontdoor", "backstop"):
+            self.assertEqual(self.run_cli(FakeClient(), "listen", "--budget", "100",
+                                          "--role", role), 3)
+            self.assertEqual((self.state / "frontdoor.wanted").read_text(), "999")
+
     def test_one_401_recovers_same_cursor_and_lock(self):
         client = FakeClient(polls=[{"work": [], "cursor": "saved", "truncated": True},
                                   self.auth(), {"work": [work_item()]}])
@@ -90,7 +268,8 @@ class ListenerResilienceTests(unittest.TestCase):
         self.sleep.assert_called_once_with(15)
         self.assertFalse((self.state / "auth_failed").exists())
         self.assertEqual((self.state / "auth_blips").read_text(), "1000\n")
-        self.assertFalse((self.state / "run.lock").exists())
+        self.assertEqual(json.loads((self.state / "run.lock").read_text()),
+                         self.handling_of())
 
     def test_three_auth_failures_pause(self):
         client = FakeClient({"get_self": self.auth()}, polls=[])
@@ -124,7 +303,8 @@ class ListenerResilienceTests(unittest.TestCase):
         self.assertEqual(json.loads(self.stdout.getvalue()), {"work": []})
         self.assertEqual(client.calls, [])
         self.assertFalse((self.state / "run.lock").exists())
-        self.assertFalse((self.state / "frontdoor.wanted").exists())
+        # The marker belongs to the front door that wrote it.
+        self.assertTrue((self.state / "frontdoor.wanted").exists())
 
     def test_backstop_yields_before_next_poll(self):
         client = FakeClient(polls=[{"work": []}])
