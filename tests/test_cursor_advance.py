@@ -32,12 +32,15 @@ class CursorAdvanceTests(unittest.TestCase):
     def deliver(self, budget=100):
         items = [work_item(messages=[{'event_id': 'greeting'}, {'event_id': 'question'}]),
                  work_item(messages=[{'event_id': 'other'}])]
+        for item in items:
+            item['reply_with']['args']['in_reply_to'] = item['messages'][-1]['event_id']
         client = FakeClient(polls=[{'work': items, 'cursor': 'delivered'}])
         self.assertEqual(filament._listen_loop(client, 1000 + budget, 30), 0)
 
     def reply(self, ids, client=None):
-        return filament.cmd_reply(client or FakeClient(), json.dumps(work_item()['reply_with']),
-                                  'Answer', ids)
+        reply_with = work_item()['reply_with']
+        reply_with['args']['in_reply_to'] = ids.split(',')[-1]
+        return filament.cmd_reply(client or FakeClient(), json.dumps(reply_with), 'Answer', ids)
 
     def test_delivery_records_all_ids_in_both_poll_branches(self):
         for budget in (100, 10):
@@ -90,6 +93,77 @@ class CursorAdvanceTests(unittest.TestCase):
                 'post_message': filament.FilamentError('failed')}))
         self.assertEqual(len(self.pending()['ids']), 3)
         self.assertEqual(filament._load_cursor(), 'before')
+
+    def test_rejected_reply_restores_answerability(self):
+        self.deliver()
+        original = (self.state / 'last_delivery.json').read_bytes()
+        rpc_client = filament.Client()
+        rejection = json.dumps({'jsonrpc': '2.0', 'error': {
+            'code': -32603, 'message': 'Reply rejected'}}).encode()
+        with patch.object(rpc_client, '_raw_post', return_value=rejection):
+            with self.assertRaises(filament.FilamentError) as caught:
+                rpc_client.tool_call('post_message', {}, timeout=30)
+        with self.assertRaises(filament.FilamentError):
+            self.reply('greeting,question', FakeClient({'post_message': caught.exception}))
+        self.assertNotIn('question', filament._load_replied())
+        self.assertNotIn('greeting', filament._load_replied())
+        self.assertEqual((self.state / 'last_delivery.json').read_bytes(), original)
+        self.deliver()
+        client = FakeClient()
+        self.reply('greeting,question', client)
+        self.assertEqual(client.calls[-1][0], 'post_message')
+        self.assertEqual(client.calls[-1][1]['in_reply_to'], 'question')
+        self.assertEqual(self.pending()['ids'], ['other'])
+
+    def test_unknown_reply_outcome_keeps_duplicate_protection(self):
+        self.deliver()
+        original = self.pending()
+        with self.assertRaises(filament.FilamentError):
+            self.reply('greeting,question', FakeClient({'post_message': TimeoutError('timeout')}))
+        self.assertTrue({'greeting', 'question'} <= filament._load_replied().keys())
+        self.assertEqual(self.pending(), original)
+        self.assertEqual(filament._load_cursor(), 'before')
+
+    def test_null_reply_is_consumed_at_delivery(self):
+        for budget in (10, 100):
+            with self.subTest(budget=budget):
+                client = FakeClient(polls=[{'work': [work_item(reply_with=None)],
+                                           'cursor': 'consumed'}])
+                self.assertEqual(filament._listen_loop(client, 1000 + budget, 30), 0)
+                self.assertEqual(filament._load_cursor(), 'consumed')
+                self.assertFalse((self.state / 'last_delivery.json').exists())
+
+    def test_second_delivery_unions_pending_ids(self):
+        self.deliver()
+        filament._prepare_delivery({'work': [work_item(messages=[
+            {'event_id': 'question'}, {'event_id': 'new'}]),
+            work_item(messages=[{'event_id': 'other'}], reply_with=None)],
+            'cursor': 'newest'})
+        self.assertEqual(self.pending(), {'cursor': 'newest',
+                                         'ids': ['greeting', 'question', 'new']})
+        self.assertEqual(filament._load_cursor(), 'before')
+        filament.cmd_ack(FakeClient(polls=[{}]), ['greeting', 'question', 'new'])
+        self.assertEqual(filament._load_cursor(), 'newest')
+
+    def test_empty_and_filtered_polls_do_not_advance_pending_cursor(self):
+        self.deliver()
+        original = self.pending()
+        filament._record_replied(['greeting', 'question', 'other'])
+        for filtered in (False, True):
+            for budget in (10, 100):
+                with self.subTest(filtered=filtered, budget=budget):
+                    work = [work_item(messages=[{'event_id': 'question'}])] if filtered else []
+                    polls = [{'work': work, 'cursor': 'unsafe', 'truncated': True}]
+                    if budget == 100:
+                        polls.append({'work': [], 'cursor': 'also-unsafe'})
+                    client = FakeClient(polls=polls)
+                    times = [1000, 1095] if budget == 100 else [1000, 1000]
+                    with patch.object(filament.time, 'time', side_effect=times):
+                        self.assertEqual(filament._listen_loop(client, 1000 + budget, 30), 3)
+                    self.assertEqual(filament._load_cursor(), 'before')
+                    self.assertEqual(self.pending(), original)
+                    self.assertTrue(all(args['cursor'] == 'before'
+                                        for tool, args, _ in client.calls if tool == 'poll_work'))
 
     def test_answered_messages_are_annotated_in_both_poll_branches(self):
         filament._record_replied(['old', 'history'])

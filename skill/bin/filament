@@ -12,6 +12,7 @@ See SKILL.md and references/protocol.md.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import io
@@ -21,6 +22,7 @@ import re
 import signal
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -172,8 +174,9 @@ def _record_replied(event_ids):
 class FilamentError(Exception):
     """A failed Filament request. auth=True means the token was rejected."""
 
-    def __init__(self, message, auth=False, code=None):
+    def __init__(self, message, auth=False, code=None, rejected=False):
         super().__init__(message)
+        self.rejected = rejected
         self.auth = auth
         self.code = code
         self.auth_handled = False
@@ -258,8 +261,8 @@ class Client:
             code = err.get("code") if isinstance(err, dict) else None
             msg = err.get("message") if isinstance(err, dict) else str(err)
             if code in AUTH_ERROR_CODES:
-                raise FilamentError(f"auth error {code}: {msg}", auth=True, code=code)
-            raise FilamentError(f"JSON-RPC error {code}: {msg}")
+                raise FilamentError(f"auth error {code}: {msg}", auth=True, code=code, rejected=True)
+            raise FilamentError(f"JSON-RPC error {code}: {msg}", code=code, rejected=True)
         result = data.get("result")
         if isinstance(result, dict) and result.get("_sessionId"):
             self.session_id = result["_sessionId"]
@@ -812,6 +815,14 @@ def cmd_reply(client, with_json, body, for_ids):
         _record_replied(event_ids)
     try:
         result = client.tool_call(tool, arguments, timeout=30)
+    except FilamentError as e:
+        if e.rejected:
+            with _state_guard():
+                mapping = _load_replied()
+                for event_id in event_ids:
+                    mapping.pop(event_id, None)
+                _save_replied(mapping)
+        raise
     except (urllib.error.URLError, OSError) as e:
         raise FilamentError(
             f"reply: network error (outcome unknown, not retried): {e}")
@@ -1009,34 +1020,66 @@ def _save_cursor(cursor):
         write_state("cursor", cursor)
 
 
-def _save_delivery(delivery):
-    write_state("last_delivery.json.tmp", json.dumps(delivery))
-    os.replace(state_path("last_delivery.json.tmp"), state_path("last_delivery.json"))
+@contextmanager
+def _state_guard():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(state_path("run.lock.guard"), "a") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        yield
+
+
+def _load_delivery_locked():
+    """Caller holds run.lock.guard for the entire state transition."""
+    try:
+        with open(state_path("last_delivery.json")) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def _save_delivery_locked(delivery):
+    """Caller holds run.lock.guard; each write owns its temporary file."""
+    fd, tmp = tempfile.mkstemp(prefix="last_delivery.", suffix=".tmp", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(delivery, f)
+        os.replace(tmp, state_path("last_delivery.json"))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _save_poll_cursor(cursor):
+    with _state_guard():
+        delivery = _load_delivery_locked()
+        if not delivery or not delivery["ids"]:
+            _save_cursor(cursor)
+        return _load_cursor()
 
 
 def _handle_delivery_ids(event_ids):
-    """Advance the cursor only once this delivery has been fully handled."""
-    try:
-        with open(state_path("last_delivery.json")) as f:
-            delivery = json.load(f)
-    except FileNotFoundError:
-        return
-    handled = set(event_ids)
-    remaining = [event_id for event_id in delivery["ids"] if event_id not in handled]
-    if remaining == delivery["ids"]:
-        return
-    if remaining:
-        delivery["ids"] = remaining
-        _save_delivery(delivery)
-    else:
-        _save_cursor(delivery["cursor"])
-        os.remove(state_path("last_delivery.json"))
+    """Advance the cursor only once all pending deliveries are handled."""
+    with _state_guard():
+        delivery = _load_delivery_locked()
+        if delivery is None:
+            return
+        handled = set(event_ids)
+        remaining = [eid for eid in delivery["ids"] if eid not in handled]
+        if remaining == delivery["ids"]:
+            return
+        if remaining:
+            delivery["ids"] = remaining
+            _save_delivery_locked(delivery)
+        else:
+            _save_cursor(delivery["cursor"])
+            _remove_state("last_delivery.json")
 
 
 def _prepare_delivery(out):
-    """Keep answered messages as context and persist all delivered message ids."""
+    """Annotate answered messages and merge outstanding delivery ids."""
     replied = _load_replied()
     ids = []
+    consumed = set()
     for item in out["work"]:
         for field in ("messages", "context"):
             for message in item.get(field, []):
@@ -1046,11 +1089,22 @@ def _prepare_delivery(out):
                 if not event_id:
                     continue
                 if field == "messages":
-                    ids.append(event_id)
+                    if item.get("reply_with") is None:
+                        consumed.add(event_id)
+                    else:
+                        ids.append(event_id)
                 if event_id in replied:
                     message["already_answered"] = True
     _trim_context(out)
-    _save_delivery({"cursor": out.get("cursor"), "ids": ids})
+    with _state_guard():
+        previous = _load_delivery_locked()
+        pending = list(dict.fromkeys((previous["ids"] if previous else []) + ids))
+        pending = [eid for eid in pending if eid not in consumed]
+        if pending:
+            _save_delivery_locked({"cursor": out.get("cursor"), "ids": pending})
+        else:
+            _save_cursor(out.get("cursor"))
+            _remove_state("last_delivery.json")
 
 
 def _poll(client, cursor, skip_ids, poll_wait, deadline):
@@ -1277,7 +1331,7 @@ def _listen_loop(client, deadline, wait):
                 _prepare_delivery(out)
                 print(json.dumps(out))
                 return 0
-            _save_cursor(inner.get("cursor"))
+            _save_poll_cursor(inner.get("cursor"))
             print(json.dumps({"work": []}))
             return 3
         poll_wait = min(wait, remaining - 10, 60)
@@ -1295,8 +1349,7 @@ def _listen_loop(client, deadline, wait):
             _prepare_delivery(out)
             print(json.dumps(out))
             return 0
-        cursor = inner.get("cursor", cursor)
-        _save_cursor(cursor)
+        cursor = _save_poll_cursor(inner.get("cursor", cursor))
         if inner.get("truncated"):
             continue
         if answered and not fresh:
@@ -1400,11 +1453,13 @@ def main(argv=None):
 
     if args.cmd == "reset":
         for name in ("auth_failed", "alerted", "failures", "run.lock",
-                     "frontdoor.wanted", "auth_blips", "last_delivery.json"):
+                     "frontdoor.wanted", "auth_blips"):
             try:
                 os.remove(state_path(name))
             except OSError:
                 pass
+        with _state_guard():
+            _remove_state("last_delivery.json")
         print(json.dumps({"reset": True}))
         return 0
 
