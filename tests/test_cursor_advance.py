@@ -88,10 +88,18 @@ class CursorAdvanceTests(unittest.TestCase):
 
     def test_failed_reply_does_not_complete_delivery(self):
         self.deliver()
+        rpc_client = filament.Client()
+        rejection = json.dumps({'jsonrpc': '2.0', 'error': {
+            'code': -32603, 'message': 'Reply rejected'}}).encode()
+        with patch.object(rpc_client, '_raw_post', return_value=rejection):
+            with self.assertRaises(filament.FilamentError) as caught:
+                rpc_client.tool_call('post_message', {}, timeout=30)
         with self.assertRaises(filament.FilamentError):
             self.reply('greeting,question,other', FakeClient({
-                'post_message': filament.FilamentError('failed')}))
-        self.assertEqual(len(self.pending()['ids']), 3)
+                'post_message': caught.exception}))
+        self.assertEqual(self.pending()['ids'], ['greeting', 'question', 'other'])
+        self.assertTrue({'greeting', 'question', 'other'}.isdisjoint(
+            filament._load_replied()))
         self.assertEqual(filament._load_cursor(), 'before')
 
     def test_rejected_reply_restores_answerability(self):
@@ -117,11 +125,10 @@ class CursorAdvanceTests(unittest.TestCase):
 
     def test_unknown_reply_outcome_keeps_duplicate_protection(self):
         self.deliver()
-        original = self.pending()
         with self.assertRaises(filament.FilamentError):
             self.reply('greeting,question', FakeClient({'post_message': TimeoutError('timeout')}))
         self.assertTrue({'greeting', 'question'} <= filament._load_replied().keys())
-        self.assertEqual(self.pending(), original)
+        self.assertEqual(self.pending(), {'cursor': 'delivered', 'ids': ['other']})
         self.assertEqual(filament._load_cursor(), 'before')
 
     def test_mixed_old_new_rejection_preserves_old_ids(self):
