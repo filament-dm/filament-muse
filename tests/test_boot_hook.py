@@ -45,7 +45,8 @@ date() { printf '10000'; }
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.splitlines()
 
-    def test_backstop_alive_or_handling_still_wakes(self):
+    def test_non_frontdoor_and_defensive_unknown_statuses_still_wake(self):
+        # 'handling' and 'unknown' are defensive fixtures, not CLI statuses.
         for status in ({'listener': 'none'}, {'listener': 'alive', 'role': 'backstop'},
                        {'listener': 'handling', 'role': 'backstop'},
                        {'listener': 'handling', 'role': 'frontdoor'},
@@ -69,6 +70,10 @@ date() { printf '10000'; }
         self.assertEqual(self.run_hook(PATH=str(self.root)), ['silent:jq missing'])
         self.cli.unlink()
         self.assertEqual(self.run_hook(), ['silent:filament CLI missing or not executable'])
+
+    def test_multiple_state_objects_never_consume_wake(self):
+        self.assertEqual(self.run_hook(TEST_STATE='{}\n{}'),
+                         ['silent:invalid hook state JSON'])
 
     def test_boot_id_and_uptime_dedupe(self):
         self.assertTrue(self.run_hook(TEST_STATE='{"wake_boot_id":"boot-one"}')[0].startswith('silent:'))

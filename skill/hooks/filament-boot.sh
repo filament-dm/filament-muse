@@ -22,7 +22,7 @@ UPTIME_SECS="${UPTIME_RAW%%.*}"
 STATE="$(hook_state_get)" || quiet "hook state unavailable"
 # Empty state is normal before the first wake; malformed state is not.
 STATE="${STATE:-\{\}}"
-printf '%s' "$STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || quiet "invalid hook state JSON"
+printf '%s' "$STATE" | jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 || quiet "invalid hook state JSON"
 if [ -n "$BOOT_ID" ] && [ "$BOOT_ID" != unknown ]; then
     SEEN="$(printf '%s' "$STATE" | jq -r '.wake_boot_id // empty')"
     [ "$SEEN" != "$BOOT_ID" ] || quiet "already woke for this boot"
