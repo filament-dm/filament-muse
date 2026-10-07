@@ -421,6 +421,7 @@ def cmd_ack(client, event_ids):
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(
         lambda: _ack_only(client, event_ids), None, "poll_work ack")
+    _handle_delivery_ids(event_ids)
     print(json.dumps(parse_tool_result(result), indent=2))
     return 0
 
@@ -791,6 +792,7 @@ def cmd_reply(client, with_json, body, for_ids):
         call_with_retry(client.handshake, None, "handshake")
         call_with_retry(
             lambda: _ack_only(client, event_ids), None, "poll_work ack")
+        _handle_delivery_ids(event_ids)
         diag(f"duplicate reply suppressed; acked {len(event_ids)} id(s)")
         print(json.dumps({"acked": event_ids}))
         return 0
@@ -813,6 +815,7 @@ def cmd_reply(client, with_json, body, for_ids):
     except (urllib.error.URLError, OSError) as e:
         raise FilamentError(
             f"reply: network error (outcome unknown, not retried): {e}")
+    _handle_delivery_ids(event_ids)
     print(json.dumps(parse_tool_result(result), indent=2))
     return 0
 
@@ -1004,6 +1007,50 @@ def _load_cursor():
 def _save_cursor(cursor):
     if cursor:
         write_state("cursor", cursor)
+
+
+def _save_delivery(delivery):
+    write_state("last_delivery.json.tmp", json.dumps(delivery))
+    os.replace(state_path("last_delivery.json.tmp"), state_path("last_delivery.json"))
+
+
+def _handle_delivery_ids(event_ids):
+    """Advance the cursor only once this delivery has been fully handled."""
+    try:
+        with open(state_path("last_delivery.json")) as f:
+            delivery = json.load(f)
+    except FileNotFoundError:
+        return
+    handled = set(event_ids)
+    remaining = [event_id for event_id in delivery["ids"] if event_id not in handled]
+    if remaining == delivery["ids"]:
+        return
+    if remaining:
+        delivery["ids"] = remaining
+        _save_delivery(delivery)
+    else:
+        _save_cursor(delivery["cursor"])
+        os.remove(state_path("last_delivery.json"))
+
+
+def _prepare_delivery(out):
+    """Keep answered messages as context and persist all delivered message ids."""
+    replied = _load_replied()
+    ids = []
+    for item in out["work"]:
+        for field in ("messages", "context"):
+            for message in item.get(field, []):
+                if not isinstance(message, dict):
+                    continue
+                event_id = message.get("event_id")
+                if not event_id:
+                    continue
+                if field == "messages":
+                    ids.append(event_id)
+                if event_id in replied:
+                    message["already_answered"] = True
+    _trim_context(out)
+    _save_delivery({"cursor": out.get("cursor"), "ids": ids})
 
 
 def _poll(client, cursor, skip_ids, poll_wait, deadline):
@@ -1200,7 +1247,7 @@ def _listen_loop(client, deadline, wait):
             raise
         diag(f"heartbeat failed ({e}) — continuing to poll anyway")
 
-    # state/cursor only ever moves past polls that handed out no fresh work.
+    # state/cursor moves past empty polls or deliveries fully handled by reply/ack.
     # A poll acknowledges everything up to the cursor it passes, so a run
     # that resumes from it gets back any work whose turn never answered it;
     # answered and acked items are read by then and stay away.
@@ -1227,7 +1274,7 @@ def _listen_loop(client, deadline, wait):
                 _enrich_items(client, fresh, time.time() + 20)
                 out = dict(inner)
                 out["work"] = fresh
-                _trim_context(out)
+                _prepare_delivery(out)
                 print(json.dumps(out))
                 return 0
             _save_cursor(inner.get("cursor"))
@@ -1245,7 +1292,7 @@ def _listen_loop(client, deadline, wait):
             _enrich_items(client, fresh, deadline)
             out = dict(inner)
             out["work"] = fresh
-            _trim_context(out)
+            _prepare_delivery(out)
             print(json.dumps(out))
             return 0
         cursor = inner.get("cursor", cursor)
@@ -1353,7 +1400,7 @@ def main(argv=None):
 
     if args.cmd == "reset":
         for name in ("auth_failed", "alerted", "failures", "run.lock",
-                     "frontdoor.wanted", "auth_blips"):
+                     "frontdoor.wanted", "auth_blips", "last_delivery.json"):
             try:
                 os.remove(state_path(name))
             except OSError:
