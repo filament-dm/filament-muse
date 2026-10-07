@@ -12,6 +12,7 @@ See SKILL.md and references/protocol.md.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import io
@@ -21,6 +22,7 @@ import re
 import signal
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -45,6 +47,8 @@ CLIENT_INFO = {"name": "filament-skill", "version": "1.0"}
 AUTH_ERROR_CODES = {-32001, -32002}
 # A lock whose mtime is younger than this is a live listener.
 LOCK_ALIVE_SECONDS = 120
+# A delivered message still unhandled after this long is given up on.
+PENDING_DELIVERY_SECONDS = 3600
 # Duplicate-reply guard: last N replied event ids (no expiry; the server's
 # work state is best-effort, so an id answered once is never answered again
 # while it is still recorded here).
@@ -172,8 +176,9 @@ def _record_replied(event_ids):
 class FilamentError(Exception):
     """A failed Filament request. auth=True means the token was rejected."""
 
-    def __init__(self, message, auth=False, code=None):
+    def __init__(self, message, auth=False, code=None, rejected=False):
         super().__init__(message)
+        self.rejected = rejected
         self.auth = auth
         self.code = code
         self.auth_handled = False
@@ -213,7 +218,8 @@ class Client:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                raise FilamentError(f"HTTP {e.code} from {url}", auth=True)
+                raise FilamentError(f"HTTP {e.code} from {url}", auth=True,
+                                   rejected=True)
             raise
         sid = resp.headers.get("Mcp-Session-Id")
         if sid:
@@ -258,8 +264,8 @@ class Client:
             code = err.get("code") if isinstance(err, dict) else None
             msg = err.get("message") if isinstance(err, dict) else str(err)
             if code in AUTH_ERROR_CODES:
-                raise FilamentError(f"auth error {code}: {msg}", auth=True, code=code)
-            raise FilamentError(f"JSON-RPC error {code}: {msg}")
+                raise FilamentError(f"auth error {code}: {msg}", auth=True, code=code, rejected=True)
+            raise FilamentError(f"JSON-RPC error {code}: {msg}", code=code, rejected=True)
         result = data.get("result")
         if isinstance(result, dict) and result.get("_sessionId"):
             self.session_id = result["_sessionId"]
@@ -417,7 +423,11 @@ def _ack_only(client, event_ids):
 def cmd_ack(client, event_ids):
     # A skipped item is handled like an answered one: if the server's ack does
     # not take, the duplicate guard in listen filters the item when it resurfaces.
+    # The ids leave the pending delivery before the network call: once the
+    # cursor moves past them the next poll acknowledges them, so an ack that
+    # never lands cannot hold the cursor back.
     _record_replied(event_ids)
+    _handle_delivery_ids(event_ids)
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(
         lambda: _ack_only(client, event_ids), None, "poll_work ack")
@@ -788,6 +798,7 @@ def cmd_reply(client, with_json, body, for_ids):
     if event_ids and all(e in _load_replied() for e in event_ids):
         # Duplicate guard: every id in this item was already replied to,
         # so ack it instead of posting a second reply.
+        _handle_delivery_ids(event_ids)
         call_with_retry(client.handshake, None, "handshake")
         call_with_retry(
             lambda: _ack_only(client, event_ids), None, "poll_work ack")
@@ -798,7 +809,7 @@ def cmd_reply(client, with_json, body, for_ids):
     arguments["markdown_body"] = body
     # The handshake is idempotent and safe to retry. The reply itself gets
     # exactly one attempt: the server refuses a second reply to the same item,
-    # so on an unknown outcome the next listen decides whether it landed.
+    # so an unknown outcome counts as handled to prevent duplicate replies.
     call_with_retry(client.handshake, None, "handshake")
     # Record AFTER the handshake succeeds, immediately before the reply
     # request: a handshake failure (network blip) must not mark the item
@@ -806,13 +817,28 @@ def cmd_reply(client, with_json, body, for_ids):
     # fresh. Once the reply is attempted, an unknown outcome (timeout,
     # reset) counts as replied, so a repeat of the item is acked rather
     # than answered twice.
+    newly_recorded_ids = set()
     if event_ids:
-        _record_replied(event_ids)
+        with _state_guard():
+            newly_recorded_ids = set(event_ids) - _load_replied().keys()
+            _record_replied(event_ids)
     try:
         result = client.tool_call(tool, arguments, timeout=30)
+    except FilamentError as e:
+        if e.rejected:
+            with _state_guard():
+                mapping = _load_replied()
+                for event_id in newly_recorded_ids:
+                    mapping.pop(event_id, None)
+                _save_replied(mapping)
+        else:
+            _handle_delivery_ids(event_ids)
+        raise
     except (urllib.error.URLError, OSError) as e:
+        _handle_delivery_ids(event_ids)
         raise FilamentError(
             f"reply: network error (outcome unknown, not retried): {e}")
+    _handle_delivery_ids(event_ids)
     print(json.dumps(parse_tool_result(result), indent=2))
     return 0
 
@@ -1004,6 +1030,118 @@ def _load_cursor():
 def _save_cursor(cursor):
     if cursor:
         write_state("cursor", cursor)
+
+
+@contextmanager
+def _state_guard():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(state_path("run.lock.guard"), "a") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        yield
+
+
+def _load_delivery_locked():
+    """Caller holds run.lock.guard for the entire state transition.
+
+    A pending delivery older than PENDING_DELIVERY_SECONDS is given up: its
+    cursor becomes state/cursor so one item that never comes back cannot hold
+    the cursor forever. An unreadable file is dropped the same way.
+    """
+    try:
+        with open(state_path("last_delivery.json")) as f:
+            delivery = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        diag(f"last_delivery.json unreadable ({e}) - dropping it")
+        _remove_state("last_delivery.json")
+        return None
+    if (not isinstance(delivery, dict) or not isinstance(delivery.get("ids"), list)
+            or not isinstance(delivery.get("cursor"), (str, type(None)))):
+        diag("last_delivery.json malformed - dropping it")
+        _remove_state("last_delivery.json")
+        return None
+    since = delivery.get("since")
+    if isinstance(since, (int, float)) and time.time() - since > PENDING_DELIVERY_SECONDS:
+        diag(f"giving up on {len(delivery['ids'])} unhandled id(s) after "
+             f"{PENDING_DELIVERY_SECONDS} s")
+        _save_cursor(delivery["cursor"])
+        _remove_state("last_delivery.json")
+        return None
+    return delivery
+
+
+def _save_delivery_locked(delivery):
+    """Caller holds run.lock.guard; each write owns its temporary file."""
+    fd, tmp = tempfile.mkstemp(prefix="last_delivery.", suffix=".tmp", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(delivery, f)
+        os.replace(tmp, state_path("last_delivery.json"))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _save_poll_cursor(cursor):
+    with _state_guard():
+        delivery = _load_delivery_locked()
+        if not delivery or not delivery["ids"]:
+            _save_cursor(cursor)
+        return _load_cursor()
+
+
+def _handle_delivery_ids(event_ids):
+    """Advance the cursor only once all pending deliveries are handled."""
+    with _state_guard():
+        delivery = _load_delivery_locked()
+        if delivery is None:
+            return
+        handled = set(event_ids)
+        remaining = [eid for eid in delivery["ids"] if eid not in handled]
+        if remaining == delivery["ids"]:
+            return
+        if remaining:
+            delivery["ids"] = remaining
+            _save_delivery_locked(delivery)
+        else:
+            _save_cursor(delivery["cursor"])
+            _remove_state("last_delivery.json")
+
+
+def _prepare_delivery(out):
+    """Annotate answered messages and merge outstanding delivery ids."""
+    replied = _load_replied()
+    ids = []
+    consumed = set()
+    for item in out["work"]:
+        for field in ("messages", "context"):
+            for message in item.get(field, []):
+                if not isinstance(message, dict):
+                    continue
+                event_id = message.get("event_id")
+                if not event_id:
+                    continue
+                if field == "messages":
+                    if item.get("reply_with") is None:
+                        consumed.add(event_id)
+                    else:
+                        ids.append(event_id)
+                if event_id in replied:
+                    message["already_answered"] = True
+    _trim_context(out)
+    with _state_guard():
+        previous = _load_delivery_locked()
+        pending = list(dict.fromkeys((previous["ids"] if previous else []) + ids))
+        pending = [eid for eid in pending if eid not in consumed]
+        if pending:
+            since = previous.get("since") if previous else None
+            _save_delivery_locked({"cursor": out.get("cursor"), "ids": pending,
+                                   "since": since if since is not None
+                                   else int(time.time())})
+        else:
+            _save_cursor(out.get("cursor"))
+            _remove_state("last_delivery.json")
 
 
 def _poll(client, cursor, skip_ids, poll_wait, deadline):
@@ -1200,7 +1338,7 @@ def _listen_loop(client, deadline, wait):
             raise
         diag(f"heartbeat failed ({e}) — continuing to poll anyway")
 
-    # state/cursor only ever moves past polls that handed out no fresh work.
+    # state/cursor moves past empty polls or deliveries fully handled by reply/ack.
     # A poll acknowledges everything up to the cursor it passes, so a run
     # that resumes from it gets back any work whose turn never answered it;
     # answered and acked items are read by then and stay away.
@@ -1227,10 +1365,10 @@ def _listen_loop(client, deadline, wait):
                 _enrich_items(client, fresh, time.time() + 20)
                 out = dict(inner)
                 out["work"] = fresh
-                _trim_context(out)
+                _prepare_delivery(out)
                 print(json.dumps(out))
                 return 0
-            _save_cursor(inner.get("cursor"))
+            _save_poll_cursor(inner.get("cursor"))
             print(json.dumps({"work": []}))
             return 3
         poll_wait = min(wait, remaining - 10, 60)
@@ -1245,12 +1383,14 @@ def _listen_loop(client, deadline, wait):
             _enrich_items(client, fresh, deadline)
             out = dict(inner)
             out["work"] = fresh
-            _trim_context(out)
+            _prepare_delivery(out)
             print(json.dumps(out))
             return 0
-        cursor = inner.get("cursor", cursor)
-        _save_cursor(cursor)
-        if inner.get("truncated"):
+        polled_with = cursor
+        cursor = _save_poll_cursor(inner.get("cursor", cursor))
+        # While a delivery is pending the cursor is held back, so the same
+        # page would come back at once; page on only when the cursor moved.
+        if inner.get("truncated") and cursor != polled_with:
             continue
         if answered and not fresh:
             # 5-second floor: only already-answered items came back, so the
@@ -1358,6 +1498,8 @@ def main(argv=None):
                 os.remove(state_path(name))
             except OSError:
                 pass
+        with _state_guard():
+            _remove_state("last_delivery.json")
         print(json.dumps({"reset": True}))
         return 0
 
