@@ -126,6 +126,20 @@ class CursorAdvanceTests(unittest.TestCase):
         self.assertEqual(client.calls[-1][1]['in_reply_to'], 'question')
         self.assertEqual(self.pending()['ids'], ['other'])
 
+    def test_http_auth_refusal_keeps_reply_answerable(self):
+        self.deliver()
+        original = (self.state / 'last_delivery.json').read_bytes()
+        rpc_client = filament.Client()
+        refused = filament.urllib.error.HTTPError('https://x', 401, 'Unauthorized', {}, None)
+        with patch.object(filament.urllib.request, 'urlopen', side_effect=refused):
+            with self.assertRaises(filament.FilamentError) as caught:
+                rpc_client.tool_call('post_message', {}, timeout=30)
+        self.assertTrue(caught.exception.auth)
+        with self.assertRaises(filament.FilamentError):
+            self.reply('greeting,question', FakeClient({'post_message': caught.exception}))
+        self.assertTrue({'greeting', 'question'}.isdisjoint(filament._load_replied()))
+        self.assertEqual((self.state / 'last_delivery.json').read_bytes(), original)
+
     def test_unknown_reply_outcome_keeps_duplicate_protection(self):
         self.deliver()
         with self.assertRaises(filament.FilamentError):

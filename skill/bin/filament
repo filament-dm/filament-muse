@@ -218,7 +218,8 @@ class Client:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                raise FilamentError(f"HTTP {e.code} from {url}", auth=True)
+                raise FilamentError(f"HTTP {e.code} from {url}", auth=True,
+                                   rejected=True)
             raise
         sid = resp.headers.get("Mcp-Session-Id")
         if sid:
