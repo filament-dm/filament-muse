@@ -803,7 +803,7 @@ def cmd_reply(client, with_json, body, for_ids):
     arguments["markdown_body"] = body
     # The handshake is idempotent and safe to retry. The reply itself gets
     # exactly one attempt: the server refuses a second reply to the same item,
-    # so on an unknown outcome the next listen decides whether it landed.
+    # so an unknown outcome counts as handled to prevent duplicate replies.
     call_with_retry(client.handshake, None, "handshake")
     # Record AFTER the handshake succeeds, immediately before the reply
     # request: a handshake failure (network blip) must not mark the item
@@ -811,19 +811,25 @@ def cmd_reply(client, with_json, body, for_ids):
     # fresh. Once the reply is attempted, an unknown outcome (timeout,
     # reset) counts as replied, so a repeat of the item is acked rather
     # than answered twice.
+    newly_recorded_ids = set()
     if event_ids:
-        _record_replied(event_ids)
+        with _state_guard():
+            newly_recorded_ids = set(event_ids) - _load_replied().keys()
+            _record_replied(event_ids)
     try:
         result = client.tool_call(tool, arguments, timeout=30)
     except FilamentError as e:
         if e.rejected:
             with _state_guard():
                 mapping = _load_replied()
-                for event_id in event_ids:
+                for event_id in newly_recorded_ids:
                     mapping.pop(event_id, None)
                 _save_replied(mapping)
+        else:
+            _handle_delivery_ids(event_ids)
         raise
     except (urllib.error.URLError, OSError) as e:
+        _handle_delivery_ids(event_ids)
         raise FilamentError(
             f"reply: network error (outcome unknown, not retried): {e}")
     _handle_delivery_ids(event_ids)

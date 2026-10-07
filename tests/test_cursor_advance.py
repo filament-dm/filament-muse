@@ -124,6 +124,36 @@ class CursorAdvanceTests(unittest.TestCase):
         self.assertEqual(self.pending(), original)
         self.assertEqual(filament._load_cursor(), 'before')
 
+    def test_mixed_old_new_rejection_preserves_old_ids(self):
+        self.deliver()
+        filament._record_replied(['greeting'])
+        original = self.pending()
+        with self.assertRaises(filament.FilamentError):
+            self.reply('greeting,question', FakeClient({
+                'post_message': filament.FilamentError('rejected', rejected=True)}))
+        self.assertIn('greeting', filament._load_replied())
+        self.assertNotIn('question', filament._load_replied())
+        self.assertEqual(self.pending(), original)
+        self.assertEqual(filament._load_cursor(), 'before')
+
+    def test_unknown_outcome_clears_pending_and_allows_advancement(self):
+        for error in (TimeoutError('timeout'), ConnectionResetError('reset'),
+                      filament.FilamentError('outcome unknown')):
+            with self.subTest(error=type(error).__name__):
+                filament._save_replied({})
+                filament._save_cursor('before')
+                self.deliver()
+                with self.assertRaises(filament.FilamentError):
+                    self.reply('greeting,question', FakeClient({'post_message': error}))
+                self.assertTrue({'greeting', 'question'} <= filament._load_replied().keys())
+                self.assertEqual(self.pending()['ids'], ['other'])
+                self.assertEqual(filament._load_cursor(), 'before')
+                with self.assertRaises(filament.FilamentError):
+                    self.reply('other', FakeClient({'post_message': error}))
+                self.assertIn('other', filament._load_replied())
+                self.assertFalse((self.state / 'last_delivery.json').exists())
+                self.assertEqual(filament._load_cursor(), 'delivered')
+
     def test_null_reply_is_consumed_at_delivery(self):
         for budget in (10, 100):
             with self.subTest(budget=budget):
