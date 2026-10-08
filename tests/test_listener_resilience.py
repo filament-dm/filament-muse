@@ -287,9 +287,9 @@ class ListenerResilienceTests(unittest.TestCase):
                          self.handling_of())
 
     def test_three_auth_failures_pause(self):
-        client = FakeClient({"get_self": self.auth()}, polls=[])
+        client = FakeClient({"get_self": self.auth()}, polls=[self.auth()])
         self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 2)
-        self.assertEqual(sum(n == "get_self" for n, _, _ in client.calls), 3)
+        self.assertEqual(sum(n == "get_self" for n, _, _ in client.calls), 2)
         self.assertEqual(self.sleep.call_args_list, [call(15), call(60)])
         self.assertTrue((self.state / "auth_failed").exists())
         self.assertFalse((self.state / "run.lock").exists())
@@ -379,7 +379,7 @@ class ListenerResilienceTests(unittest.TestCase):
     def test_deadline_before_first_or_second_probe(self):
         for budget, expected_calls, marker in ((10, 1, False), (50, 2, True)):
             with self.subTest(budget=budget):
-                client = FakeClient({"get_self": self.auth()})
+                client = FakeClient({"get_self": self.auth()}, polls=[self.auth()])
                 self.assertEqual(self.run_cli(client, "listen", "--budget", str(budget)), 2)
                 self.assertEqual(len(client.calls), expected_calls)
                 self.assertEqual((self.state / "auth_failed").exists(), marker)
@@ -401,7 +401,7 @@ class ListenerResilienceTests(unittest.TestCase):
     def test_second_probe_success_recovers(self):
         client = FakeClient(polls=[self.auth(), {"work": [work_item()]}])
         original = client.tool_call
-        identities = iter([{}, self.auth(), {}])
+        identities = iter([self.auth(), {}])
 
         def request(name, args, timeout=30):
             if name == "get_self":
@@ -443,7 +443,7 @@ class ListenerResilienceTests(unittest.TestCase):
     def test_probe_network_error_waits_for_next_probe(self):
         client = FakeClient(polls=[self.auth(), {"work": [work_item()]}])
         original = client.tool_call
-        identities = iter([{}, filament.urllib.error.URLError("down"), {}])
+        identities = iter([filament.urllib.error.URLError("down"), {}])
 
         def request(name, args, timeout=30):
             if name == "get_self":

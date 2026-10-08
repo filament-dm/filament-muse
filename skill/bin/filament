@@ -1385,11 +1385,18 @@ def _trim_context(out):
             return
 
 
-def _listen_loop(client, deadline, wait, on_delivery=None):
-    # Heartbeat once: presence flickers on. Best effort — a failed heartbeat
-    # never stops the poll loop, but an auth failure ends the run.
+def _timing(polled_at):
+    """When poll_work returned the work and when the listener handed it over,
+    as epoch seconds, so a slow reply can be traced to the server, the
+    context reads or the turn."""
+    return {"polled_at": round(polled_at, 3), "delivered_at": round(time.time(), 3)}
+
+
+def _announce(client):
+    """Read the agent's identity and send one heartbeat, so presence flickers
+    on. Best effort: a failure never stops the poll loop, but an auth failure
+    ends the run."""
     try:
-        call_with_retry(client.handshake, None, "handshake")
         agent_name, principal_name = load_identity(client)
         diag(f"listening as {agent_name} (principal: {principal_name})")
         call_with_retry(client.heartbeat, None, "heartbeat")
@@ -1397,6 +1404,19 @@ def _listen_loop(client, deadline, wait, on_delivery=None):
         if e.auth:
             raise
         diag(f"heartbeat failed ({e}) — continuing to poll anyway")
+
+
+def _listen_loop(client, deadline, wait, on_delivery=None):
+    try:
+        call_with_retry(client.handshake, None, "handshake")
+    except FilamentError as e:
+        if e.auth:
+            raise
+        diag(f"handshake failed ({e}) — continuing to poll anyway")
+    # The identity read and heartbeat wait until the first poll comes back
+    # empty: work that arrived while the previous turn was answering is
+    # handed over without those round trips.
+    announced = False
 
     # state/cursor moves past empty polls or deliveries fully handled by reply/ack.
     # A poll acknowledges everything up to the cursor it passes, so a run
@@ -1414,6 +1434,7 @@ def _listen_loop(client, deadline, wait, on_delivery=None):
             # so we never report "no work" without asking the server.
             try:
                 inner = _poll(client, cursor, skip_ids, 0, None)
+                polled_at = time.time()
             except FilamentError as e:
                 if e.auth:
                     raise
@@ -1425,6 +1446,7 @@ def _listen_loop(client, deadline, wait, on_delivery=None):
                 _enrich_items(client, fresh, time.time() + 20)
                 out = dict(inner)
                 out["work"] = fresh
+                out["timing"] = _timing(polled_at)
                 if _prepare_delivery(out) and on_delivery is not None:
                     on_delivery()
                 print(json.dumps(out))
@@ -1438,16 +1460,21 @@ def _listen_loop(client, deadline, wait, on_delivery=None):
         if poll_wait < 1:
             poll_wait = 1
         inner = _poll(client, cursor, skip_ids, poll_wait, deadline)
+        polled_at = time.time()
         fresh, answered = _split_work(inner.get("work") or [])
         skip_ids.update(answered)
         if fresh:
             _enrich_items(client, fresh, deadline)
             out = dict(inner)
             out["work"] = fresh
+            out["timing"] = _timing(polled_at)
             if _prepare_delivery(out) and on_delivery is not None:
                 on_delivery()
             print(json.dumps(out))
             return 0
+        if not announced:
+            _announce(client)
+            announced = True
         polled_with = cursor
         cursor = _save_poll_cursor(inner.get("cursor", cursor))
         # While a delivery is pending the cursor is held back, so the same
