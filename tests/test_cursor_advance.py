@@ -53,6 +53,17 @@ class CursorAdvanceTests(unittest.TestCase):
                                                  'ids': ['greeting', 'question', 'other']})
                 self.assertEqual(filament._load_cursor(), 'before')
 
+    def test_delivery_carries_poll_and_handoff_times(self):
+        for budget in (100, 10):
+            with self.subTest(budget=budget):
+                out = io.StringIO()
+                items = [work_item(messages=[{'event_id': 'q'}])]
+                client = FakeClient(polls=[{'work': items, 'cursor': 'delivered'}])
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(filament._listen_loop(client, 1000 + budget, 30), 0)
+                self.assertEqual(json.loads(out.getvalue())['timing'],
+                                 {'polled_at': 1000, 'delivered_at': 1000})
+
     def test_partial_then_complete_reply(self):
         self.deliver()
         self.assertEqual(self.reply('greeting,question'), 0)
