@@ -47,6 +47,9 @@ CLIENT_INFO = {"name": "filament-skill", "version": "1.0"}
 AUTH_ERROR_CODES = {-32001, -32002}
 # A lock whose mtime is younger than this is a live listener.
 LOCK_ALIVE_SECONDS = 120
+# After a delivery the lock stays held while its messages are being answered,
+# so a backstop does not take the same work; a reply or ack refreshes it.
+HANDLING_SECONDS = 240
 # A delivered message still unhandled after this long is given up on.
 PENDING_DELIVERY_SECONDS = 3600
 # Duplicate-reply guard: last N replied event ids (no expiry; the server's
@@ -136,11 +139,23 @@ def _lock_info():
     return data, time.time() - st.st_mtime
 
 
+def _lock_active(content, age):
+    if content is None:
+        return False
+    if "handling" in content:
+        return age < HANDLING_SECONDS
+    return age < LOCK_ALIVE_SECONDS
+
+
 def _touch_lock():
-    try:
-        os.utime(state_path("run.lock"), None)
-    except OSError:
-        pass
+    with _state_guard():
+        if not os.path.exists(state_path("run.lock")):
+            return
+        try:
+            now = time.time()
+            os.utime(state_path("run.lock"), (now, now))
+        except OSError:
+            pass
 
 
 def _load_replied():
@@ -956,8 +971,8 @@ class _ListeningClient:
 
 
 def cmd_listen(client, deadline, wait, role="frontdoor"):
-    lock = state_path("run.lock")
     owned = False
+    wanted_written = False
     old_term = None
     run_start = os.environ.get("FILAMENT_RUN_START")
     try:
@@ -966,10 +981,30 @@ def cmd_listen(client, deadline, wait, role="frontdoor"):
         run_start = int(time.time())
     lock_data = {"start": str(run_start), "role": role}
 
-    def cleanup():
-        if owned and _lock_info()[0] == lock_data:
-            _remove_state("run.lock")
+    def clear_wanted():
+        # A fresh marker belongs to the front door that wrote it.
+        try:
+            with open(state_path("frontdoor.wanted")) as f:
+                fresh = time.time() - os.fstat(f.fileno()).st_mtime < 120
+                if fresh and (not wanted_written or f.read().strip() != str(run_start)):
+                    return
+        except OSError:
+            return
         _remove_state("frontdoor.wanted")
+
+    def blocks_listener(content, age):
+        # A front door takes over its own handling lock: its turn has ended.
+        if (content is not None and "handling" in content
+                and role == "frontdoor" and content["role"] == "frontdoor"):
+            return False
+        return _lock_active(content, age)
+
+    def cleanup():
+        # A handling lock no longer equals lock_data, so it outlives the run.
+        with _state_guard():
+            if owned and _lock_info()[0] == lock_data:
+                _remove_state("run.lock")
+            clear_wanted()
 
     def on_term(signum, frame):
         cleanup()
@@ -980,35 +1015,39 @@ def cmd_listen(client, deadline, wait, role="frontdoor"):
         if os.path.exists(state_path("auth_failed")):
             diag("auth_failed marker present - no request attempted")
             return 2
-        _yield_if_wanted(role)
-        handoff_end = min(deadline, time.time() + 60)
+        handoff_start = time.time()
         while True:
-            content, age = _lock_info()
-            if content is None or age >= LOCK_ALIVE_SECONDS:
-                break
-            if role != "frontdoor" or content["role"] != "backstop":
-                diag("another run is listening - exiting")
-                return 3
-            write_state("frontdoor.wanted", str(run_start))
-            if time.time() + 2 > handoff_end:
-                return 3
+            with _state_guard():
+                content, age = _lock_info()
+                if not blocks_listener(content, age):
+                    _yield_if_wanted(role)
+                    write_state("run.lock", json.dumps({"start": run_start, "role": role}))
+                    owned = True
+                    clear_wanted()
+                    break
+                if role != "frontdoor" or content["role"] != "backstop":
+                    diag("another run is handling work - exiting" if "handling" in content
+                         else "another run is listening - exiting")
+                    return 3
+                write_state("frontdoor.wanted", str(run_start))
+                wanted_written = True
+                limit = HANDLING_SECONDS if "handling" in content else 60
+                handoff_end = min(deadline, handoff_start + limit)
+                if time.time() + 2 > handoff_end:
+                    return 3
             time.sleep(2)
-        os.makedirs(STATE_DIR, exist_ok=True)
-        # Starters check and claim the lock one at a time, so two of them can
-        # never both clear the same stale lock and each create their own.
-        with open(state_path("run.lock.guard"), "a") as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            content, age = _lock_info()
-            if content is not None and age < LOCK_ALIVE_SECONDS:
-                return 3
-            if content is not None:
-                _remove_state("run.lock")
-            with open(lock, "x") as f:
-                json.dump({"start": run_start, "role": role}, f)
-        owned = True
-        if role == "frontdoor":
-            _remove_state("frontdoor.wanted")
-        return _listen_loop(_ListeningClient(client, deadline, role), deadline, wait)
+
+        def delivered():
+            with _state_guard():
+                # A reply may have cleared the delivery since it was saved;
+                # a handling mark with nothing pending would never be released.
+                pending = _load_delivery_locked()
+                if _lock_info()[0] == lock_data and pending and pending["ids"]:
+                    write_state("run.lock", json.dumps({
+                        "start": run_start, "role": role, "handling": time.time()}))
+
+        return _listen_loop(_ListeningClient(client, deadline, role), deadline, wait,
+                            on_delivery=delivered)
     except _ListenerYield:
         print(json.dumps({"work": []}))
         return 3
@@ -1035,9 +1074,28 @@ def _save_cursor(cursor):
 @contextmanager
 def _state_guard():
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(state_path("run.lock.guard"), "a") as guard:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        yield
+    # SIGTERM cleanup takes this guard too; deferring the signal while it is
+    # held keeps the handler from deadlocking on its own process.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        with open(state_path("run.lock.guard"), "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _release_handling_locked(done):
+    """Caller holds run.lock.guard. Release a handling lock once its delivery
+    is done; otherwise refresh it, since a reply or ack shows the turn is alive."""
+    content, _ = _lock_info()
+    if content is None or "handling" not in content:
+        return
+    if done:
+        _remove_state("run.lock")
+    else:
+        now = time.time()
+        os.utime(state_path("run.lock"), (now, now))
 
 
 def _load_delivery_locked():
@@ -1107,6 +1165,7 @@ def _handle_delivery_ids(event_ids):
         else:
             _save_cursor(delivery["cursor"])
             _remove_state("last_delivery.json")
+        _release_handling_locked(not remaining)
 
 
 def _prepare_delivery(out):
@@ -1142,6 +1201,7 @@ def _prepare_delivery(out):
         else:
             _save_cursor(out.get("cursor"))
             _remove_state("last_delivery.json")
+    return bool(pending)
 
 
 def _poll(client, cursor, skip_ids, poll_wait, deadline):
@@ -1325,7 +1385,7 @@ def _trim_context(out):
             return
 
 
-def _listen_loop(client, deadline, wait):
+def _listen_loop(client, deadline, wait, on_delivery=None):
     # Heartbeat once: presence flickers on. Best effort — a failed heartbeat
     # never stops the poll loop, but an auth failure ends the run.
     try:
@@ -1365,7 +1425,8 @@ def _listen_loop(client, deadline, wait):
                 _enrich_items(client, fresh, time.time() + 20)
                 out = dict(inner)
                 out["work"] = fresh
-                _prepare_delivery(out)
+                if _prepare_delivery(out) and on_delivery is not None:
+                    on_delivery()
                 print(json.dumps(out))
                 return 0
             _save_poll_cursor(inner.get("cursor"))
@@ -1383,7 +1444,8 @@ def _listen_loop(client, deadline, wait):
             _enrich_items(client, fresh, deadline)
             out = dict(inner)
             out["work"] = fresh
-            _prepare_delivery(out)
+            if _prepare_delivery(out) and on_delivery is not None:
+                on_delivery()
             print(json.dumps(out))
             return 0
         polled_with = cursor
@@ -1409,13 +1471,14 @@ def _listen_loop(client, deadline, wait):
 
 
 def cmd_ensure():
-    """Front-door status check: alive, paused, or none. Never starts a listener."""
+    """Front-door status check: alive, handling, paused, or none. Never starts a listener."""
     if os.path.exists(state_path("auth_failed")):
         print(json.dumps({"listener": "paused"}))
         return 0
     content, age = _lock_info()
-    if content is not None and age < LOCK_ALIVE_SECONDS:
-        print(json.dumps({"listener": "alive", "role": content["role"]}))
+    if _lock_active(content, age):
+        print(json.dumps({"listener": "handling" if "handling" in content else "alive",
+                          "role": content["role"]}))
         return 0
     print(json.dumps({"listener": "none"}))
     return 0
@@ -1492,14 +1555,10 @@ def main(argv=None):
     os.makedirs(STATE_DIR, exist_ok=True)
 
     if args.cmd == "reset":
-        for name in ("auth_failed", "alerted", "failures", "run.lock",
-                     "frontdoor.wanted", "auth_blips"):
-            try:
-                os.remove(state_path(name))
-            except OSError:
-                pass
         with _state_guard():
-            _remove_state("last_delivery.json")
+            for name in ("auth_failed", "alerted", "failures", "run.lock",
+                         "frontdoor.wanted", "auth_blips", "last_delivery.json"):
+                _remove_state(name)
         print(json.dumps({"reset": True}))
         return 0
 
