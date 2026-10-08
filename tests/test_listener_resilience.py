@@ -120,6 +120,21 @@ class ListenerResilienceTests(unittest.TestCase):
         self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
         self.assertFalse((self.state / "run.lock").exists())
 
+    def test_a_delivery_answered_before_the_lock_is_marked_is_not_held(self):
+        # A reply landing between saving the delivery and marking the lock
+        # must not leave a handling lock that nothing would release.
+        prepare = filament._prepare_delivery
+
+        def answered_at_once(out):
+            result = prepare(out)
+            (self.state / "last_delivery.json").unlink()
+            return result
+
+        client = FakeClient(polls=[{"work": [work_item()]}])
+        with patch.object(filament, "_prepare_delivery", answered_at_once):
+            self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
+        self.assertFalse((self.state / "run.lock").exists())
+
     def test_successful_reply_ack_and_reset_clear_handling(self):
         for args in (("ack", "event"),
                      ("reply", "--with", '{"tool":"post_message"}',

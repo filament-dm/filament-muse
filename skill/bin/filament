@@ -1039,7 +1039,10 @@ def cmd_listen(client, deadline, wait, role="frontdoor"):
 
         def delivered():
             with _state_guard():
-                if _lock_info()[0] == lock_data:
+                # A reply may have cleared the delivery since it was saved;
+                # a handling mark with nothing pending would never be released.
+                pending = _load_delivery_locked()
+                if _lock_info()[0] == lock_data and pending and pending["ids"]:
                     write_state("run.lock", json.dumps({
                         "start": run_start, "role": role, "handling": time.time()}))
 
