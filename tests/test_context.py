@@ -100,6 +100,17 @@ class ContextTests(unittest.TestCase):
         code = filament._listen_loop(client, self.now + budget, 30)
         return code, json.loads(self.stdout.getvalue())
 
+    def test_identity_and_heartbeat_follow_an_empty_first_poll(self):
+        client = FakeClient({"get_self": {"display_name": "Wally"}},
+                            polls=[{"work": [], "cursor": "c1"},
+                                   {"work": [work_item()], "cursor": "c2"}])
+        code, _ = self.listen(client)
+        self.assertEqual(code, 0)
+        names = [name for name, _, _ in client.calls]
+        self.assertEqual(names[0], "poll_work")
+        self.assertLess(names.index("poll_work"), names.index("get_self"))
+        self.assertEqual(client.heartbeats, 1)
+
     def test_room_context_sorted_filtered_merged_and_media_copied(self):
         media = [{"url": "mxc://room/image", "filename": "image.png"}]
         messages = [
@@ -369,7 +380,8 @@ class ContextTests(unittest.TestCase):
                          if c.args[2] in ("get_recent_messages", "get_thread")]
                 self.assertEqual([c[1] for c in reads], [enrichment_deadline] * 2)
                 self.assertEqual(client.handshakes, 1)
-                self.assertEqual(client.heartbeats, 1)
+                # Work on the first poll is handed over before the heartbeat.
+                self.assertEqual(client.heartbeats, 0)
                 self.assertEqual(filament._load_replied(), {})
                 self.assertFalse(any(name in ("post_message", "reply_in_thread")
                                      for name, _, _ in client.calls))

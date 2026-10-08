@@ -1392,11 +1392,11 @@ def _timing(polled_at):
     return {"polled_at": round(polled_at, 3), "delivered_at": round(time.time(), 3)}
 
 
-def _listen_loop(client, deadline, wait, on_delivery=None):
-    # Heartbeat once: presence flickers on. Best effort — a failed heartbeat
-    # never stops the poll loop, but an auth failure ends the run.
+def _announce(client):
+    """Read the agent's identity and send one heartbeat, so presence flickers
+    on. Best effort: a failure never stops the poll loop, but an auth failure
+    ends the run."""
     try:
-        call_with_retry(client.handshake, None, "handshake")
         agent_name, principal_name = load_identity(client)
         diag(f"listening as {agent_name} (principal: {principal_name})")
         call_with_retry(client.heartbeat, None, "heartbeat")
@@ -1404,6 +1404,19 @@ def _listen_loop(client, deadline, wait, on_delivery=None):
         if e.auth:
             raise
         diag(f"heartbeat failed ({e}) — continuing to poll anyway")
+
+
+def _listen_loop(client, deadline, wait, on_delivery=None):
+    try:
+        call_with_retry(client.handshake, None, "handshake")
+    except FilamentError as e:
+        if e.auth:
+            raise
+        diag(f"handshake failed ({e}) — continuing to poll anyway")
+    # The identity read and heartbeat wait until the first poll comes back
+    # empty: work that arrived while the previous turn was answering is
+    # handed over without those round trips.
+    announced = False
 
     # state/cursor moves past empty polls or deliveries fully handled by reply/ack.
     # A poll acknowledges everything up to the cursor it passes, so a run
@@ -1459,6 +1472,9 @@ def _listen_loop(client, deadline, wait, on_delivery=None):
                 on_delivery()
             print(json.dumps(out))
             return 0
+        if not announced:
+            _announce(client)
+            announced = True
         polled_with = cursor
         cursor = _save_poll_cursor(inner.get("cursor", cursor))
         # While a delivery is pending the cursor is held back, so the same
