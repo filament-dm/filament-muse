@@ -45,6 +45,8 @@ CREDENTIAL_NAME = "custom.filament-oauth"
 CLIENT_INFO = {"name": "filament-skill", "version": "1.0"}
 
 AUTH_ERROR_CODES = {-32001, -32002}
+# Invalid request, unknown method, invalid params: a retry gets the same answer.
+DETERMINISTIC_ERROR_CODES = {-32600, -32601, -32602}
 # A lock whose mtime is younger than this is a live listener.
 LOCK_ALIVE_SECONDS = 120
 # After a delivery the lock stays held while its messages are being answered,
@@ -320,8 +322,9 @@ def call_with_retry(fn, deadline, desc):
     """Run fn(); retry retryable failures 3x with 2/4/8s backoff.
 
     Retryable: HTTP 5xx, 429, connection errors, malformed JSON, JSON-RPC
-    errors other than -32001/-32002. Auth errors and credential errors
-    propagate immediately. Never sleeps past deadline (None = no deadline).
+    errors other than -32001/-32002 and -32600/-32601/-32602. Auth errors,
+    credential errors and those deterministic JSON-RPC errors propagate
+    immediately. Never sleeps past deadline (None = no deadline).
     """
     last = None
     for attempt, backoff in enumerate((0, 2, 4, 8)):
@@ -333,7 +336,7 @@ def call_with_retry(fn, deadline, desc):
         try:
             return fn()
         except FilamentError as e:
-            if e.auth:
+            if e.auth or e.code in DETERMINISTIC_ERROR_CODES:
                 raise
             last = e
         except (urllib.error.URLError, OSError) as e:
@@ -698,8 +701,8 @@ def cmd_profile(client, avatar_path, about, crop_spec, no_crop):
     uploaded, and a copy is saved to state/media/avatar-preview.png.
     The box used is printed.
     set_profile is then called with the mxc url as `image` (plus `about`
-    when given). The display name is never touched: the user chose it in
-    Filament.
+    when given). It never sets the name; the Muse guide sets it with
+    `call set_profile` when Filament gave the agent its default name.
     """
     if crop_spec and no_crop:
         raise FilamentError("--crop and --no-crop are mutually exclusive")
