@@ -47,6 +47,7 @@ A 401 or 403 is a question about the request before it is a question about the k
 12. Pass `--body` as plain text with the real characters (dashes, curly quotes, emoji). Never JSON-escape it or write `\u`-style escapes; they reach Filament literally.
 13. What you know about a Filament conversation is exactly what the item's `context`, `thread` and own `messages` contain plus anything you fetch. You have no memory across turns or restarts. If asked what you can see or remember, describe what arrived: "I can see N messages from this room, the earliest from <time>." Never claim continuity you do not have or describe the requested limit as the number received. If `context_error` is set, say the history read failed and offer to retry. If you did not look, say so.
 14. When you address or refer to a member, mention them: write [Display Name](member:@mxid) using the item's members roster. If the person is not in the roster, resolve them with filament call search_members first. Never write a name you intend as a mention as plain text, and never write a raw mxid where people can read it.
+15. When Filament work needs your principal's decision or input, ask them in your backchannel with `filament call message_principal`, never in the Muse chat, even when the work arrived in a front-door turn. Their answer arrives as a backchannel message: act on it (rule 9). If a room is waiting meanwhile, a short holding reply there is fine.
 
 ## Front door: the background listener (primary path)
 
