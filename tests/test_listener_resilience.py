@@ -115,6 +115,22 @@ class ListenerResilienceTests(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "run.lock").read_text()),
                          self.handling_of())
 
+    def test_cli_use_keeps_a_fresh_handling_lock_fresh(self):
+        self.handling_lock(age=200)
+        filament.cmd_call(FakeClient(), "search_messages", '{"query": "asks"}')
+        self.assertEqual(os.stat(self.state / "run.lock").st_mtime, self.now)
+        self.now += 200
+        client = FakeClient()
+        self.assertEqual(self.run_cli(client, "listen", "--budget", "100",
+                                      "--role", "backstop"), 3)
+        self.assertEqual(client.calls, [])
+
+    def test_cli_use_leaves_a_stale_handling_lock_stale(self):
+        self.handling_lock(age=filament.HANDLING_SECONDS)
+        filament.cmd_call(FakeClient(), "search_messages", '{"query": "asks"}')
+        self.assertEqual(os.stat(self.state / "run.lock").st_mtime,
+                         self.now - filament.HANDLING_SECONDS)
+
     def test_delivery_with_nothing_to_answer_releases_the_lock(self):
         client = FakeClient(polls=[{"work": [work_item(reply_with=None)]}])
         self.assertEqual(self.run_cli(client, "listen", "--budget", "100"), 0)
