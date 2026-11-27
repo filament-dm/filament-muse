@@ -100,6 +100,31 @@ class CursorAdvanceTests(unittest.TestCase):
         self.assertEqual(filament._load_cursor(), 'delivered')
         self.assertFalse((self.state / 'last_delivery.json').exists())
 
+    def test_call_for_answers_like_a_reply(self):
+        self.deliver()
+        client = FakeClient()
+        self.assertEqual(filament.cmd_call(client, 'message_principal',
+                                           '{"markdown_body": "Answer"}', 'greeting,question'), 0)
+        self.assertEqual([c[0] for c in client.calls], ['message_principal'])
+        self.assertTrue({'greeting', 'question'} <= filament._load_replied().keys())
+        self.assertEqual(self.pending(), {'cursor': 'delivered', 'ids': ['other']})
+
+    def test_call_for_already_answered_ids_acks_instead(self):
+        self.deliver()
+        filament._record_replied(['other'])
+        client = FakeClient(polls=[{}])
+        self.assertEqual(filament.cmd_call(client, 'message_principal',
+                                           '{"markdown_body": "Again"}', 'other'), 0)
+        self.assertEqual([c[0] for c in client.calls], ['poll_work'])
+        self.assertEqual(self.pending()['ids'], ['greeting', 'question'])
+
+    def test_call_without_for_leaves_delivery_pending(self):
+        self.deliver()
+        original = self.pending()
+        filament.cmd_call(FakeClient(), 'message_principal', '{"markdown_body": "Q?"}')
+        self.assertEqual(self.pending(), original)
+        self.assertTrue({'greeting', 'question', 'other'}.isdisjoint(filament._load_replied()))
+
     def test_failed_reply_does_not_complete_delivery(self):
         self.deliver()
         rpc_client = filament.Client()

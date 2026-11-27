@@ -141,6 +141,24 @@ def _lock_info():
     return data, time.time() - st.st_mtime
 
 
+def _touch_handling():
+    """Keep a fresh handling lock fresh while its turn still uses the CLI.
+
+    A turn that reads channels for minutes would otherwise outlive
+    HANDLING_SECONDS, and a backstop would hand the same work to a second turn.
+    A stale lock is left alone: a backstop may already own that work.
+    """
+    with _state_guard():
+        content, age = _lock_info()
+        if content is None or "handling" not in content or age >= HANDLING_SECONDS:
+            return
+        try:
+            now = time.time()
+            os.utime(state_path("run.lock"), (now, now))
+        except OSError:
+            pass
+
+
 def _lock_active(content, age):
     if content is None:
         return False
@@ -395,7 +413,7 @@ def cmd_self(client):
     return 0
 
 
-def cmd_call(client, tool, args_json):
+def cmd_call(client, tool, args_json, for_ids=""):
     try:
         arguments = json.loads(args_json)
     except json.JSONDecodeError as e:
@@ -403,6 +421,15 @@ def cmd_call(client, tool, args_json):
     if isinstance(arguments, dict):
         # A null argument means "not given"; the server rejects an explicit null.
         arguments = {k: v for k, v in arguments.items() if v is not None}
+    _touch_handling()
+    event_ids = _split_ids(for_ids)
+    if event_ids:
+        # An answer posted some other way than reply_with (message_principal,
+        # a post without in_reply_to) is not marked read on the server, so
+        # without this bookkeeping the restarted listener hands it over again.
+        if not isinstance(arguments, dict):
+            raise FilamentError("--for needs a JSON object of arguments")
+        return _answer_once(client, tool, arguments, event_ids)
     call_with_retry(client.handshake, None, "handshake")
     result = call_with_retry(lambda: client.tool_call(tool, arguments),
                              None, f"tools/call {tool}")
@@ -480,6 +507,7 @@ def cmd_media(mxc_url, out_path):
     """
     if not mxc_url.startswith("mxc://"):
         raise FilamentError(f"not an mxc url: {mxc_url}")
+    _touch_handling()
     query = urllib.parse.urlencode({"mxc_url": mxc_url})
     req = urllib.request.Request(BASE_URL + "/media?" + query, method="GET")
     dc.add_surrogate_to_request(req, CREDENTIAL_NAME,
@@ -807,12 +835,23 @@ def cmd_reply(client, with_json, body, for_ids):
     tool = rw.get("tool")
     if not tool:
         raise FilamentError("--with JSON has no 'tool'")
-    event_ids = [e.strip() for e in (for_ids or "").split(",") if e.strip()]
+    event_ids = _split_ids(for_ids)
     # Identity first: the handshake is idempotent and safe to retry, and
     # nothing below records anything, so a failure here never marks the
     # item replied.
     call_with_retry(client.handshake, None, "handshake")
     load_identity(client)
+    arguments = dict(rw.get("args") or {})
+    arguments["markdown_body"] = body
+    return _answer_once(client, tool, arguments, event_ids)
+
+
+def _split_ids(for_ids):
+    return [e.strip() for e in (for_ids or "").split(",") if e.strip()]
+
+
+def _answer_once(client, tool, arguments, event_ids):
+    """Post an answer to ``event_ids`` exactly once, behind the duplicate guard."""
     if event_ids and all(e in _load_replied() for e in event_ids):
         # Duplicate guard: every id in this item was already replied to,
         # so ack it instead of posting a second reply.
@@ -823,11 +862,9 @@ def cmd_reply(client, with_json, body, for_ids):
         diag(f"duplicate reply suppressed; acked {len(event_ids)} id(s)")
         print(json.dumps({"acked": event_ids}))
         return 0
-    arguments = dict(rw.get("args") or {})
-    arguments["markdown_body"] = body
     # The handshake is idempotent and safe to retry. The reply itself gets
-    # exactly one attempt: the server refuses a second reply to the same item,
-    # so an unknown outcome counts as handled to prevent duplicate replies.
+    # exactly one attempt: the server accepts a second reply to the same
+    # message, so an unknown outcome counts as handled to prevent duplicates.
     call_with_retry(client.handshake, None, "handshake")
     # Record AFTER the handshake succeeds, immediately before the reply
     # request: a handshake failure (network blip) must not mark the item
@@ -1548,6 +1585,10 @@ def build_parser():
     pc = sub.add_parser("call", help="generic tools/call passthrough")
     pc.add_argument("tool")
     pc.add_argument("args_json")
+    pc.add_argument("--for", dest="for_ids", default="",
+                    help="comma-separated event ids this call answers: it is "
+                         "made once, with the same duplicate guard and "
+                         "bookkeeping as reply")
 
     pm = sub.add_parser("media", help="download a media attachment by mxc url")
     pm.add_argument("mxc_url")
@@ -1609,7 +1650,7 @@ def main(argv=None):
         if args.cmd == "self":
             return cmd_self(client)
         if args.cmd == "call":
-            return cmd_call(client, args.tool, args.args_json)
+            return cmd_call(client, args.tool, args.args_json, args.for_ids)
         if args.cmd == "hello":
             return cmd_hello(client)
         if args.cmd == "ack":
